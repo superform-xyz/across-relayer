@@ -7,7 +7,6 @@ import {
   Signer,
   winston,
   convertFromWei,
-  getL1TokenInfo,
   getProvider,
   EventSearchConfig,
   ethers,
@@ -15,6 +14,8 @@ import {
   paginatedEventQuery,
   mapAsync,
   BigNumber,
+  TOKEN_SYMBOLS_MAP,
+  getTokenInfo,
 } from "../../../utils";
 import { FinalizerPromise, CrossChainMessage } from "../../types";
 import { TokensBridged } from "../../../interfaces";
@@ -202,10 +203,15 @@ export async function lineaL2ToL1Finalizer(
   // Get src events
   const l2SrcEvents = spokePoolClient
     .getTokensBridged()
-    .filter(({ blockNumber }) => blockNumber >= l2FromBlock && blockNumber <= l2ToBlock);
+    .filter(
+      ({ blockNumber, l2TokenAddress }) =>
+        blockNumber >= l2FromBlock &&
+        blockNumber <= l2ToBlock &&
+        l2TokenAddress !== TOKEN_SYMBOLS_MAP["USDC"].addresses[l2ChainId]
+    );
 
   // Get Linea's MessageSent events for each src event
-  const uniqueTxHashes = Array.from(new Set(l2SrcEvents.map((event) => event.transactionHash)));
+  const uniqueTxHashes = Array.from(new Set(l2SrcEvents.map(({ txnRef }) => txnRef)));
   const relevantMessages = (
     await Promise.all(uniqueTxHashes.map((txHash) => getMessagesWithStatusByTxHash(txHash)))
   ).flat();
@@ -261,12 +267,12 @@ export async function lineaL2ToL1Finalizer(
   // Populate cross chain transfers for claimed messages
   const transfers = claimable.map(({ tokensBridged }) => {
     const { l2TokenAddress, amountToReturn } = tokensBridged;
-    const { decimals, symbol: l1TokenSymbol } = getL1TokenInfo(l2TokenAddress, l2ChainId);
+    const { decimals, symbol } = getTokenInfo(l2TokenAddress, l2ChainId);
     const amountFromWei = convertFromWei(amountToReturn.toString(), decimals);
     const transfer: CrossChainMessage = {
       originationChainId: l2ChainId,
       destinationChainId: l1ChainId,
-      l1TokenSymbol,
+      l1TokenSymbol: symbol,
       amount: amountFromWei,
       type: "withdrawal",
     };
@@ -301,7 +307,7 @@ export async function lineaL2ToL1Finalizer(
 
 function mergeMessagesWithTokensBridged(messages: MessageWithStatus[], allTokensBridgedEvents: TokensBridged[]) {
   const messagesByTxHash = groupBy(messages, ({ txHash }) => txHash);
-  const tokensBridgedEventByTxHash = groupBy(allTokensBridgedEvents, ({ transactionHash }) => transactionHash);
+  const tokensBridgedEventByTxHash = groupBy(allTokensBridgedEvents, ({ txnRef }) => txnRef);
 
   const merged: {
     message: MessageWithStatus;

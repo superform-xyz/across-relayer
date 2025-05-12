@@ -1,25 +1,42 @@
 import { utils } from "@across-protocol/sdk";
 import {
-  spokesThatHoldEthAndWeth,
+  spokesThatHoldNativeTokens,
   SUPPORTED_TOKENS,
   CUSTOM_BRIDGE,
   CANONICAL_BRIDGE,
   DEFAULT_GAS_MULTIPLIER,
+  CUSTOM_L2_BRIDGE,
+  CANONICAL_L2_BRIDGE,
 } from "../../common/Constants";
 import { InventoryConfig, OutstandingTransfers } from "../../interfaces";
-import { BigNumber, isDefined, winston, Signer, getL2TokenAddresses, TransactionResponse, assert } from "../../utils";
+import {
+  BigNumber,
+  isDefined,
+  winston,
+  Signer,
+  getL2TokenAddresses,
+  TransactionResponse,
+  assert,
+  Profiler,
+  EvmAddress,
+  toAddressType,
+  TOKEN_EQUIVALENCE_REMAPPING,
+  getRemoteTokenForL1Token,
+  getTokenInfo,
+} from "../../utils";
 import { SpokePoolClient, HubPoolClient } from "../";
 import { CHAIN_IDs, TOKEN_SYMBOLS_MAP } from "@across-protocol/constants";
 import { BaseChainAdapter } from "../../adapter";
 
 export class AdapterManager {
+  private profiler: InstanceType<typeof Profiler>;
   public adapters: { [chainId: number]: BaseChainAdapter } = {};
 
   // Some L2's canonical bridges send ETH, not WETH, over the canonical bridges, resulting in recipient addresses
   // receiving ETH that needs to be wrapped on the L2. This array contains the chainIds of the chains that this
   // manager will attempt to wrap ETH on into WETH. This list also includes chains like Arbitrum where the relayer is
   // expected to receive ETH as a gas refund from an L1 to L2 deposit that was intended to rebalance inventory.
-  private chainsToWrapEtherOn = [...spokesThatHoldEthAndWeth, CHAIN_IDs.ARBITRUM, CHAIN_IDs.MAINNET];
+  private chainsToWrapEtherOn = [...spokesThatHoldNativeTokens, CHAIN_IDs.ARBITRUM, CHAIN_IDs.MAINNET];
 
   constructor(
     readonly logger: winston.Logger,
@@ -54,9 +71,29 @@ export class AdapterManager {
           const l2Signer = spokePoolClients[chainId].spokePool.signer;
           const l1Token = TOKEN_SYMBOLS_MAP[symbol].addresses[hubChainId];
           const bridgeConstructor = CUSTOM_BRIDGE[chainId]?.[l1Token] ?? CANONICAL_BRIDGE[chainId];
-          const bridge = new bridgeConstructor(chainId, hubChainId, l1Signer, l2Signer, l1Token);
+          const bridge = new bridgeConstructor(chainId, hubChainId, l1Signer, l2Signer, EvmAddress.from(l1Token));
           return [l1Token, bridge];
         }) ?? []
+      );
+    };
+    const constructL2Bridges = (chainId: number) => {
+      if (chainId === hubChainId) {
+        return {};
+      }
+      const l2Signer = spokePoolClients[chainId].spokePool.signer;
+      return Object.fromEntries(
+        SUPPORTED_TOKENS[chainId]
+          ?.map((symbol) => {
+            const l1Token = TOKEN_SYMBOLS_MAP[symbol].addresses[hubChainId];
+            const canonicalBridge = CANONICAL_L2_BRIDGE[chainId];
+            if (!isDefined(canonicalBridge)) {
+              return undefined;
+            }
+            const bridgeConstructor = CUSTOM_L2_BRIDGE[chainId]?.[l1Token] ?? canonicalBridge;
+            const bridge = new bridgeConstructor(chainId, hubChainId, l2Signer, l1Signer, EvmAddress.from(l1Token));
+            return [l1Token, bridge];
+          })
+          .filter(isDefined) ?? []
       );
     };
     Object.keys(this.spokePoolClients).map((_chainId) => {
@@ -67,12 +104,17 @@ export class AdapterManager {
         spokePoolClients,
         chainId,
         hubChainId,
-        filterMonitoredAddresses(chainId),
+        filterMonitoredAddresses(chainId).map((address) => toAddressType(address, chainId)),
         logger,
         SUPPORTED_TOKENS[chainId] ?? [],
         constructBridges(chainId),
+        constructL2Bridges(chainId),
         DEFAULT_GAS_MULTIPLIER[chainId] ?? 1
       );
+    });
+    this.profiler = new Profiler({
+      logger: this.logger,
+      at: "AdapterManager",
     });
     logger.debug({
       at: "AdapterManager#constructor",
@@ -92,39 +134,88 @@ export class AdapterManager {
   getOutstandingCrossChainTokenTransferAmount(chainId: number, l1Tokens: string[]): Promise<OutstandingTransfers> {
     const adapter = this.adapters[chainId];
     // @dev The adapter should filter out tokens that are not supported by the adapter, but we do it here as well.
-    const adapterSupportedL1Tokens = l1Tokens.filter((token) =>
-      adapter.supportedTokens.includes(this.hubPoolClient.getTokenInfo(CHAIN_IDs.MAINNET, token).symbol)
-    );
+    const adapterSupportedL1Tokens = l1Tokens.filter((token) => {
+      const tokenSymbol = getTokenInfo(token, this.hubPoolClient.chainId).symbol;
+      return (
+        adapter.supportedTokens.includes(tokenSymbol) ||
+        adapter.supportedTokens.includes(TOKEN_EQUIVALENCE_REMAPPING[tokenSymbol])
+      );
+    });
     this.logger.debug({
       at: "AdapterManager",
       message: `Getting outstandingCrossChainTransfers for ${chainId}`,
       adapterSupportedL1Tokens,
       searchConfigs: adapter.getUpdatedSearchConfigs(),
     });
-    return this.adapters[chainId].getOutstandingCrossChainTransfers(adapterSupportedL1Tokens);
+    return this.adapters[chainId].getOutstandingCrossChainTransfers(
+      adapterSupportedL1Tokens.map((l1Token) => EvmAddress.from(l1Token))
+    );
   }
 
   sendTokenCrossChain(
     address: string,
-    chainId: number | string,
+    chainId: number,
     l1Token: string,
     amount: BigNumber,
     simMode = false,
     l2Token?: string
   ): Promise<TransactionResponse> {
-    chainId = Number(chainId); // Ensure chainId is a number before using.
     this.logger.debug({ at: "AdapterManager", message: "Sending token cross-chain", chainId, l1Token, amount });
-    l2Token ??= this.l2TokenForL1Token(l1Token, Number(chainId));
-    return this.adapters[chainId].sendTokenToTargetChain(address, l1Token, l2Token, amount, simMode);
+    l2Token ??= this.l2TokenForL1Token(l1Token, chainId);
+    return this.adapters[chainId].sendTokenToTargetChain(
+      toAddressType(address, chainId),
+      EvmAddress.from(l1Token),
+      toAddressType(l2Token, chainId),
+      amount,
+      simMode
+    );
   }
 
-  // Check how much ETH is on the target chain and if it is above the threshold the wrap it to WETH. Note that this only
-  // needs to be done on chains where rebalancing WETH from L1 to L2 results in the relayer receiving ETH
-  // (not the ERC20), or if the relayer expects to be sent ETH perhaps as a gas refund from an original L1 to L2
+  withdrawTokenFromL2(
+    address: string,
+    chainId: number | string,
+    l2Token: string,
+    amount: BigNumber,
+    simMode = false
+  ): Promise<string[]> {
+    chainId = Number(chainId);
+    this.logger.debug({
+      at: "AdapterManager",
+      message: "Withdrawing token from L2",
+      chainId,
+      l2Token,
+      amount,
+    });
+    const txnReceipts = this.adapters[chainId].withdrawTokenFromL2(
+      EvmAddress.from(address),
+      toAddressType(l2Token, chainId),
+      amount,
+      simMode
+    );
+    return txnReceipts;
+  }
+
+  async getL2PendingWithdrawalAmount(
+    lookbackPeriodSeconds: number,
+    chainId: number | string,
+    fromAddress: string,
+    l2Token: string
+  ): Promise<BigNumber> {
+    chainId = Number(chainId);
+    return await this.adapters[chainId].getL2PendingWithdrawalAmount(
+      lookbackPeriodSeconds,
+      toAddressType(fromAddress, chainId),
+      toAddressType(l2Token, chainId)
+    );
+  }
+
+  // Check how many native tokens are on the target chain and if the number of tokens is above the wrap threshold, execute a wrap. Note that this only
+  // needs to be done on chains where rebalancing the native token from L1 to L2 results in the relayer receiving the unwrapped native token
+  // (not the ERC20), or if the relayer expects to be sent the native token perhaps as a gas refund from an original L1 to L2
   // deposit. This currently happens on Arbitrum, where the relayer address is set as the Arbitrum_Adapter's
   // L2 refund recipient, and on ZkSync, because the relayer is set as the refund recipient when rebalancing
   // inventory from L1 to ZkSync via the AtomicDepositor.
-  async wrapEthIfAboveThreshold(inventoryConfig: InventoryConfig, simMode = false): Promise<void> {
+  async wrapNativeTokenIfAboveThreshold(inventoryConfig: InventoryConfig, simMode = false): Promise<void> {
     await utils.mapAsync(
       this.chainsToWrapEtherOn.filter((chainId) => isDefined(this.spokePoolClients[chainId])),
       async (chainId) => {
@@ -135,7 +226,7 @@ export class AdapterManager {
           wrapThreshold.gte(wrapTarget),
           `wrapEtherThreshold ${wrapThreshold.toString()} must be >= wrapEtherTarget ${wrapTarget.toString()}`
         );
-        await this.adapters[chainId].wrapEthIfAboveThreshold(wrapThreshold, wrapTarget, simMode);
+        await this.adapters[chainId].wrapNativeTokenIfAboveThreshold(wrapThreshold, wrapTarget, simMode);
       }
     );
   }
@@ -150,7 +241,7 @@ export class AdapterManager {
     try {
       // That the line below is critical. if the hubpoolClient returns the wrong destination token for the L1 token then
       // the bot can irrecoverably send the wrong token to the chain and loose money. It should crash if this is detected.
-      const l2TokenForL1Token = this.hubPoolClient.getL2TokenForL1TokenAtBlock(l1Token, chainId);
+      const l2TokenForL1Token = getRemoteTokenForL1Token(l1Token, chainId, this.hubPoolClient);
       if (!l2TokenForL1Token) {
         throw new Error(`No L2 token found for L1 token ${l1Token} on chain ${chainId}`);
       }
@@ -176,7 +267,9 @@ export class AdapterManager {
     for (const chainId of this.supportedChains()) {
       const adapter = this.adapters[chainId];
       if (isDefined(adapter)) {
-        const hubTokens = l1Tokens.filter((token) => this.l2TokenExistForL1Token(token, chainId));
+        const hubTokens = l1Tokens
+          .filter((token) => this.l2TokenExistForL1Token(token, chainId))
+          .map((l1Token) => EvmAddress.from(l1Token));
         await adapter.checkTokenApprovals(hubTokens);
       }
     }

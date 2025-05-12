@@ -8,7 +8,7 @@ import {
   depositV3,
   ethers,
   expect,
-  fillV3,
+  fillV3Relay,
   lastSpyLogIncludes,
   lastSpyLogLevel,
   requestSlowFill,
@@ -89,7 +89,7 @@ describe("Dataworker: Propose root bundle", async function () {
     const expectedSlowRelayRefundRoot2 = await dataworkerInstance.buildSlowRelayRoot(blockRange2, spokePoolClients);
     await dataworkerInstance.proposeRootBundle(spokePoolClients);
     // Should have enqueued a new transaction:
-    expect(lastSpyLogIncludes(spy, "Enqueing new root bundle proposal txn")).to.be.true;
+    expect(lastSpyLogIncludes(spy, "Enqueuing new root bundle proposal txn")).to.be.true;
     expect(spy.getCall(-1).lastArg.poolRebalanceRoot).to.equal(expectedPoolRebalanceRoot2.tree.getHexRoot());
     expect(spy.getCall(-1).lastArg.relayerRefundRoot).to.equal(expectedRelayerRefundRoot2.tree.getHexRoot());
     expect(spy.getCall(-1).lastArg.slowRelayRoot).to.equal(expectedSlowRelayRefundRoot2.tree.getHexRoot());
@@ -130,7 +130,7 @@ describe("Dataworker: Propose root bundle", async function () {
 
     // TEST 4:
     // Submit another fill and check that dataworker proposes another root:
-    await fillV3(spokePool_2, depositor, deposit, destinationChainId);
+    await fillV3Relay(spokePool_2, deposit, depositor, destinationChainId);
     await updateAllClients();
     const latestBlock4 = await hubPool.provider.getBlockNumber();
     const blockRange4 = [
@@ -156,7 +156,7 @@ describe("Dataworker: Propose root bundle", async function () {
     // TEST 4: cont.
     await dataworkerInstance.proposeRootBundle(spokePoolClients);
     // Should have enqueued a new transaction:
-    expect(lastSpyLogIncludes(spy, "Enqueing new root bundle proposal txn")).to.be.true;
+    expect(lastSpyLogIncludes(spy, "Enqueuing new root bundle proposal txn")).to.be.true;
     expect(spy.getCall(-1).lastArg.poolRebalanceRoot).to.equal(expectedPoolRebalanceRoot4.tree.getHexRoot());
     expect(spy.getCall(-1).lastArg.relayerRefundRoot).to.equal(expectedRelayerRefundRoot4.tree.getHexRoot());
     expect(spy.getCall(-1).lastArg.slowRelayRoot).to.equal(expectedSlowRelayRefundRoot4.tree.getHexRoot());
@@ -193,7 +193,7 @@ describe("Dataworker: Propose root bundle", async function () {
     );
 
     await updateAllClients();
-    await fillV3(spokePool_2, depositor, deposit, destinationChainId);
+    await fillV3Relay(spokePool_2, deposit, depositor, destinationChainId);
     await updateAllClients();
     await dataworkerInstance.proposeRootBundle(spokePoolClients);
     expect(multiCallerClient.transactionCount()).to.equal(0);

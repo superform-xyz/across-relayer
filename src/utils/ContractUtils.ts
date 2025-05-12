@@ -24,10 +24,14 @@ export function castSpokePoolName(networkId: number): string {
       return "Ethereum_SpokePool";
     case CHAIN_IDs.ARBITRUM:
       return "Arbitrum_SpokePool";
+    case CHAIN_IDs.BSC:
+      return "Universal_SpokePool";
     case CHAIN_IDs.ZK_SYNC:
       return "ZkSync_SpokePool";
     case CHAIN_IDs.SONEIUM:
       return "Cher_SpokePool";
+    case CHAIN_IDs.UNICHAIN || CHAIN_IDs.UNICHAIN_SEPOLIA:
+      return "DoctorWho_SpokePool";
     default:
       networkName = getNetworkName(networkId);
   }

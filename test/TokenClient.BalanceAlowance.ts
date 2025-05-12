@@ -1,6 +1,6 @@
-import { ConfigStoreClient, SpokePoolClient, TokenClient, TokenDataType } from "../src/clients"; // Tested
+import { ConfigStoreClient, SpokePoolClient, TokenDataType } from "../src/clients"; // Tested
 import { originChainId, destinationChainId, ZERO_ADDRESS } from "./constants";
-import { MockHubPoolClient } from "./mocks";
+import { MockHubPoolClient, SimpleMockTokenClient } from "./mocks";
 import {
   Contract,
   SignerWithAddress,
@@ -13,6 +13,7 @@ import {
   toBN,
   toBNWei,
   winston,
+  deployMulticall3,
 } from "./utils";
 
 describe("TokenClient: Balance and Allowance", async function () {
@@ -20,7 +21,7 @@ describe("TokenClient: Balance and Allowance", async function () {
   let erc20_1: Contract, weth_1: Contract, erc20_2: Contract, weth_2: Contract;
   let hubPoolClient: MockHubPoolClient, spokePoolClient_1: SpokePoolClient, spokePoolClient_2: SpokePoolClient;
   let owner: SignerWithAddress, spyLogger: winston.Logger;
-  let tokenClient: TokenClient; // tested
+  let tokenClient: SimpleMockTokenClient; // tested
   let spokePool1DeploymentBlock: number, spokePool2DeploymentBlock: number;
 
   const updateAllClients = async () => {
@@ -100,7 +101,14 @@ describe("TokenClient: Balance and Allowance", async function () {
 
     const spokePoolClients = { [originChainId]: spokePoolClient_1, [destinationChainId]: spokePoolClient_2 };
 
-    tokenClient = new TokenClient(spyLogger, owner.address, spokePoolClients, hubPoolClient);
+    // Deploy Multicall3 to the hardhat test networks.
+    await deployMulticall3(owner);
+
+    tokenClient = new SimpleMockTokenClient(spyLogger, owner.address, spokePoolClients, hubPoolClient);
+    tokenClient.setRemoteTokens([], {
+      [originChainId]: [erc20_1, weth_1],
+      [destinationChainId]: [erc20_2, weth_2],
+    });
   });
 
   it("Fetches all associated balances", async function () {

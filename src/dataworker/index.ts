@@ -36,11 +36,11 @@ export async function createDataworker(
 
   const dataworker = new Dataworker(
     _logger,
+    config,
     clients,
     clients.configStoreClient.getChainIdIndicesForBlock(),
     config.maxRelayerRepaymentLeafSizeOverride,
     config.maxPoolRebalanceLeafSizeOverride,
-    config.blockRangeEndBlockBuffer,
     config.spokeRootsLookbackCount,
     config.bufferToPropose,
     config.forcePropose,
@@ -69,10 +69,13 @@ export async function runDataworker(_logger: winston.Logger, baseSigner: Signer)
     }
   );
 
+  await config.update(logger); // Update address filter.
   let proposedBundleData: BundleData | undefined = undefined;
   let poolRebalanceLeafExecutionCount = 0;
   try {
-    logger[startupLogLevel(config)]({ at: "Dataworker#index", message: "Dataworker started 👩‍🔬", config });
+    // Explicitly don't log addressFilter because it can be huge and can overwhelm log transports.
+    const { addressFilter: _addressFilter, ...loggedConfig } = config;
+    logger[startupLogLevel(config)]({ at: "Dataworker#index", message: "Dataworker started 👩‍🔬", loggedConfig });
 
     for (;;) {
       profiler.mark("loopStart");
@@ -106,8 +109,8 @@ export async function runDataworker(_logger: winston.Logger, baseSigner: Signer)
         dataworkerFastLookbackCount: config.dataworkerFastLookbackCount,
         fromBlocks,
         toBlocks,
-        fromBundleTxn: fromBundle?.transactionHash,
-        toBundleTxn: toBundle?.transactionHash,
+        fromBundleTxn: fromBundle?.txnRef,
+        toBundleTxn: toBundle?.txnRef,
       });
       const spokePoolClients = await constructSpokePoolClientsForFastDataworker(
         logger,
@@ -122,7 +125,7 @@ export async function runDataworker(_logger: winston.Logger, baseSigner: Signer)
       if (config.disputerEnabled) {
         await dataworker.validatePendingRootBundle(
           spokePoolClients,
-          config.sendingDisputesEnabled,
+          config.sendingTransactionsEnabled,
           fromBlocks,
           // @dev Opportunistically publish bundle data to external storage layer since we're reconstructing it in this
           // process, if user has configured it so.
@@ -137,7 +140,7 @@ export async function runDataworker(_logger: winston.Logger, baseSigner: Signer)
         proposedBundleData = await dataworker.proposeRootBundle(
           spokePoolClients,
           config.rootBundleExecutionThreshold,
-          config.sendingProposalsEnabled,
+          config.sendingTransactionsEnabled,
           fromBlocks
         );
       } else {
@@ -151,7 +154,7 @@ export async function runDataworker(_logger: winston.Logger, baseSigner: Signer)
           poolRebalanceLeafExecutionCount = await dataworker.executePoolRebalanceLeaves(
             spokePoolClients,
             balanceAllocator,
-            config.sendingExecutionsEnabled,
+            config.sendingTransactionsEnabled,
             fromBlocks
           );
         }
@@ -161,13 +164,13 @@ export async function runDataworker(_logger: winston.Logger, baseSigner: Signer)
           await dataworker.executeSlowRelayLeaves(
             spokePoolClients,
             balanceAllocator,
-            config.sendingExecutionsEnabled,
+            config.sendingTransactionsEnabled,
             fromBlocks
           );
           await dataworker.executeRelayerRefundLeaves(
             spokePoolClients,
             balanceAllocator,
-            config.sendingExecutionsEnabled,
+            config.sendingTransactionsEnabled,
             fromBlocks
           );
         }

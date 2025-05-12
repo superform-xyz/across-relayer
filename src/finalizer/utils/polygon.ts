@@ -12,13 +12,13 @@ import {
   getCurrentTime,
   getRedisCache,
   getBlockForTimestamp,
-  getL1TokenInfo,
   compareAddressesSimple,
   Multicall2Call,
   TOKEN_SYMBOLS_MAP,
-  CHAIN_IDs,
   sortEventsAscending,
   toBNWei,
+  getTokenInfo,
+  getL1TokenAddress,
 } from "../../utils";
 import { EthersError, TokensBridged } from "../../interfaces";
 import { HubPoolClient, SpokePoolClient } from "../../clients";
@@ -27,7 +27,7 @@ import { FinalizerPromise, CrossChainMessage } from "../types";
 // Note!!: This client will only work for PoS tokens. Matic also has Plasma tokens which have a different finalization
 // process entirely.
 
-const CHAIN_ID = CHAIN_IDs.POLYGON;
+let CHAIN_ID;
 enum POLYGON_MESSAGE_STATUS {
   NOT_CHECKPOINTED = "NOT_CHECKPOINTED",
   CAN_EXIT = "CAN_EXIT",
@@ -52,6 +52,7 @@ export async function polygonFinalizer(
   spokePoolClient: SpokePoolClient
 ): Promise<FinalizerPromise> {
   const { chainId } = spokePoolClient;
+  CHAIN_ID = chainId;
 
   const posClient = await getPosClient(signer);
   const lookback = getCurrentTime() - 60 * 60 * 24 * 7;
@@ -117,7 +118,7 @@ async function getFinalizableTransactions(
 ): Promise<PolygonTokensBridged[]> {
   // First look up which L2 transactions were checkpointed to mainnet.
   const isCheckpointed = await Promise.all(
-    tokensBridged.map((event) => posClient.exitUtil.isCheckPointed(event.transactionHash))
+    tokensBridged.map((event) => posClient.exitUtil.isCheckPointed(event.txnRef))
   );
 
   // For each token bridge event that was checkpointed, store a unique log index for the event
@@ -128,8 +129,8 @@ async function getFinalizableTransactions(
   // Construct the payload we'll need to finalize each L2 transaction that has been checkpointed to Mainnet and
   // can potentially be finalized.
   const payloads = await Promise.all(
-    checkpointedTokensBridged.map((e, i) => {
-      return posClient.exitUtil.buildPayloadForExit(e.transactionHash, BURN_SIG, false, logIndexesForMessage[i]);
+    checkpointedTokensBridged.map(({ txnRef }, i) => {
+      return posClient.exitUtil.buildPayloadForExit(txnRef, BURN_SIG, false, logIndexesForMessage[i]);
     })
   );
 
@@ -261,12 +262,12 @@ function resolveCrossChainTransferStructure(
   hubPoolClient: HubPoolClient
 ): CrossChainMessage {
   const { l2TokenAddress, amountToReturn } = finalizableMessage;
-  const l1TokenInfo = getL1TokenInfo(l2TokenAddress, CHAIN_ID);
-  const amountFromWei = convertFromWei(amountToReturn.toString(), l1TokenInfo.decimals);
+  const { symbol, decimals } = getTokenInfo(l2TokenAddress, CHAIN_ID);
+  const amountFromWei = convertFromWei(amountToReturn.toString(), decimals);
   const transferBase = {
     originationChainId: CHAIN_ID,
     destinationChainId: hubPoolClient.chainId,
-    l1TokenSymbol: l1TokenInfo.symbol,
+    l1TokenSymbol: symbol,
     amount: amountFromWei,
   };
 
@@ -280,7 +281,7 @@ function getMainnetTokenBridger(mainnetSigner: Signer): Contract {
 }
 
 async function retrieveTokenFromMainnetTokenBridger(l2Token: string, mainnetSigner: Signer): Promise<Multicall2Call> {
-  const l1Token = getL1TokenInfo(l2Token, CHAIN_ID).address;
+  const l1Token = getL1TokenAddress(l2Token, CHAIN_ID);
   const mainnetTokenBridger = getMainnetTokenBridger(mainnetSigner);
   const callData = await mainnetTokenBridger.populateTransaction.retrieve(l1Token);
   return {

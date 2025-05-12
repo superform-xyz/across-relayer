@@ -22,7 +22,7 @@ import {
   depositV3,
   ethers,
   expect,
-  fillV3,
+  fillV3Relay,
   smock,
   sinon,
   lastSpyLogIncludes,
@@ -68,7 +68,6 @@ describe("Dataworker: Execute pool rebalances", async function () {
       hubPoolClient.configStoreClient as unknown as ConfigStoreClient
     );
     mockHubPoolClient.chainId = hubPoolClient.chainId;
-    mockHubPoolClient.setTokenInfoToReturn({ address: l1Token_1.address, decimals: 18, symbol: "TEST" });
     mockHubPoolClient.setTokenMapping(l1Token_1.address, hubPoolClient.chainId, l1Token_1.address);
 
     // Sub in a dummy root bundle proposal for use in HubPoolClient update.
@@ -120,7 +119,7 @@ describe("Dataworker: Execute pool rebalances", async function () {
       amountToDeposit
     );
     await updateAllClients();
-    await fillV3(spokePool_2, depositor, deposit, destinationChainId);
+    await fillV3Relay(spokePool_2, deposit, depositor, destinationChainId);
     await updateAllClients();
 
     // Executing leaves before there is a bundle should do nothing:
@@ -189,7 +188,7 @@ describe("Dataworker: Execute pool rebalances", async function () {
     );
     await updateAllClients();
     // Fill and take repayment on a non-mainnet spoke pool.
-    await fillV3(spokePool_2, depositor, deposit, destinationChainId);
+    await fillV3Relay(spokePool_2, deposit, depositor, destinationChainId);
     await updateAllClients();
 
     const balanceAllocator = getNewBalanceAllocator();
@@ -453,7 +452,7 @@ describe("Dataworker: Execute pool rebalances", async function () {
             originChainId: 10,
             depositor: randomAddress(),
             recipient: randomAddress(),
-            depositId: 0,
+            depositId: bnZero,
             inputToken: randomAddress(),
             inputAmount: slowFillAmount,
             outputToken: l1Token_1.address,
@@ -483,7 +482,74 @@ describe("Dataworker: Execute pool rebalances", async function () {
 
       // Execute mainnet refund leaf after mainnet pool leaf. Then update exchange rates to execute non-mainnet pool leaf.
       const enqueuedTxns = multiCallerClient.getQueuedTransactions(hubPoolClient.chainId);
-      expect(enqueuedTxns.map((txn) => txn.method)).to.deep.equal(["executeRootBundle", "executeV3SlowRelayLeaf"]);
+      expect(enqueuedTxns.map((txn) => txn.method)).to.deep.equal(["executeRootBundle", "executeSlowRelayLeaf"]);
+    });
+    it("Skips expired mainnet slow fill leaves", async function () {
+      const slowFillAmount = toBNWei("1");
+      const liquidReserves = toBNWei("0");
+      mockHubPoolClient.setLpTokenInfo(l1Token_1.address, 0, liquidReserves);
+
+      const poolRebalanceLeaves: PoolRebalanceLeaf[] = [
+        {
+          chainId: hubPoolClient.chainId,
+          groupIndex: 0,
+          bundleLpFees: [toBNWei("1")],
+          netSendAmounts: [toBNWei("0")],
+          runningBalances: [toBNWei("1")],
+          leafId: 0,
+          l1Tokens: [l1Token_1.address],
+        },
+      ];
+
+      // Need to set a balance for the spoke pool to make the dataworker believe this leaf can be executed.
+      balanceAllocator.testSetBalance(
+        hubPoolClient.chainId,
+        l1Token_1.address,
+        spokePoolClients[hubPoolClient.chainId].spokePool.address,
+        slowFillAmount
+      );
+
+      // Update spoke pool client to load in latest SpokePool.currentTime
+      await updateAllClients();
+      const currentTime = spokePoolClients[hubPoolClient.chainId].getCurrentTime();
+      expect(currentTime).to.be.greaterThan(0);
+      const slowFillLeaves: SlowFillLeaf[] = [
+        {
+          relayData: {
+            originChainId: 10,
+            depositor: randomAddress(),
+            recipient: randomAddress(),
+            depositId: bnZero,
+            inputToken: randomAddress(),
+            inputAmount: slowFillAmount,
+            outputToken: l1Token_1.address,
+            outputAmount: slowFillAmount,
+            message: "0x",
+            fillDeadline: currentTime - 1, // Set a value here lower than client.getCurrentTime()
+            exclusiveRelayer: randomAddress(),
+            exclusivityDeadline: 0,
+          },
+          chainId: hubPoolClient.chainId,
+          updatedOutputAmount: slowFillAmount,
+        },
+      ];
+
+      const leafCount = await dataworkerInstance._executePoolLeavesAndSyncL1Tokens(
+        spokePoolClients,
+        balanceAllocator,
+        poolRebalanceLeaves,
+        new MerkleTree<PoolRebalanceLeaf>(poolRebalanceLeaves, () => "test"),
+        [],
+        new MerkleTree<RelayerRefundLeaf>([], () => "test"),
+        slowFillLeaves,
+        new MerkleTree<SlowFillLeaf>(slowFillLeaves, () => "test"),
+        true
+      );
+      expect(leafCount).to.equal(1);
+
+      // Execute mainnet refund leaf after mainnet pool leaf. Then update exchange rates to execute non-mainnet pool leaf.
+      const enqueuedTxns = multiCallerClient.getQueuedTransactions(hubPoolClient.chainId);
+      expect(enqueuedTxns.map((txn) => txn.method)).to.deep.equal(["executeRootBundle"]);
     });
     it("No non-mainnet leaves", async function () {
       // In this test, check that if there are no mainnet leaves, then the dataworker should just execute non
@@ -628,7 +694,7 @@ describe("Dataworker: Execute pool rebalances", async function () {
       expect(errorLogs[0].lastArg.message).to.contain("Not enough funds to execute pool rebalance leaf for chain 137");
     });
     it("Only mainnet leaves", async function () {
-      // Shouuld not throw if there are only mainnet leaves.
+      // Should not throw if there are only mainnet leaves.
       const liquidReserves = toBNWei("1");
       mockHubPoolClient.setLpTokenInfo(l1Token_1.address, 0, liquidReserves);
 

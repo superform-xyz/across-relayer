@@ -1,9 +1,9 @@
 import { utils as sdkUtils } from "@across-protocol/sdk";
 import assert from "assert";
-import { Contract } from "ethers";
+import { Contract, ethers } from "ethers";
 import { getAddress } from "ethers/lib/utils";
 import { groupBy, uniq } from "lodash";
-import { AugmentedTransaction, HubPoolClient, MultiCallerClient, TransactionClient } from "../clients";
+import { AugmentedTransaction, HubPoolClient, MultiCallerClient } from "../clients";
 import {
   CONTRACT_ADDRESSES,
   Clients,
@@ -16,8 +16,6 @@ import {
 import { DataworkerConfig } from "../dataworker/DataworkerConfig";
 import { SpokePoolClientsByChain } from "../interfaces";
 import {
-  BigNumber,
-  bnZero,
   Signer,
   blockExplorerLink,
   config,
@@ -32,11 +30,13 @@ import {
   Profiler,
   stringifyThrownValue,
 } from "../utils";
-import { ChainFinalizer, CrossChainMessage } from "./types";
+import { ChainFinalizer, CrossChainMessage, isAugmentedTransaction } from "./types";
 import {
   arbStackFinalizer,
+  binanceFinalizer,
   cctpL1toL2Finalizer,
   cctpL2toL1Finalizer,
+  heliosL1toL2Finalizer,
   lineaL1ToL2Finalizer,
   lineaL2ToL1Finalizer,
   opStackFinalizer,
@@ -88,9 +88,13 @@ const chainFinalizers: { [chainId: number]: { finalizeOnL2: ChainFinalizer[]; fi
     finalizeOnL1: [arbStackFinalizer, cctpL2toL1Finalizer],
     finalizeOnL2: [cctpL1toL2Finalizer],
   },
+  [CHAIN_IDs.LENS]: {
+    finalizeOnL1: [zkSyncFinalizer],
+    finalizeOnL2: [],
+  },
   [CHAIN_IDs.LINEA]: {
-    finalizeOnL1: [lineaL2ToL1Finalizer],
-    finalizeOnL2: [lineaL1ToL2Finalizer],
+    finalizeOnL1: [lineaL2ToL1Finalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [lineaL1ToL2Finalizer, cctpL1toL2Finalizer],
   },
   [CHAIN_IDs.SCROLL]: {
     finalizeOnL1: [scrollFinalizer],
@@ -116,6 +120,10 @@ const chainFinalizers: { [chainId: number]: { finalizeOnL2: ChainFinalizer[]; fi
     finalizeOnL1: [opStackFinalizer],
     finalizeOnL2: [],
   },
+  [CHAIN_IDs.BSC]: {
+    finalizeOnL1: [binanceFinalizer],
+    finalizeOnL2: [heliosL1toL2Finalizer],
+  },
   [CHAIN_IDs.SONEIUM]: {
     finalizeOnL1: [opStackFinalizer],
     finalizeOnL2: [],
@@ -128,9 +136,25 @@ const chainFinalizers: { [chainId: number]: { finalizeOnL2: ChainFinalizer[]; fi
     finalizeOnL1: [opStackFinalizer],
     finalizeOnL2: [],
   },
+  [CHAIN_IDs.UNICHAIN]: {
+    finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [cctpL1toL2Finalizer],
+  },
   // Testnets
   [CHAIN_IDs.BASE_SEPOLIA]: {
-    finalizeOnL1: [cctpL2toL1Finalizer],
+    finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [cctpL1toL2Finalizer],
+  },
+  [CHAIN_IDs.OPTIMISM_SEPOLIA]: {
+    finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [cctpL1toL2Finalizer],
+  },
+  [CHAIN_IDs.UNICHAIN_SEPOLIA]: {
+    finalizeOnL1: [opStackFinalizer, cctpL2toL1Finalizer],
+    finalizeOnL2: [cctpL1toL2Finalizer],
+  },
+  [CHAIN_IDs.ARBITRUM_SEPOLIA]: {
+    finalizeOnL1: [arbStackFinalizer, cctpL2toL1Finalizer],
     finalizeOnL2: [cctpL1toL2Finalizer],
   },
   [CHAIN_IDs.MODE_SEPOLIA]: {
@@ -151,24 +175,12 @@ const chainFinalizers: { [chainId: number]: { finalizeOnL2: ChainFinalizer[]; fi
   },
 };
 
-function enrichL1ToL2AddressesToFinalize(l1ToL2AddressesToFinalize: string[], addressesToEnsure: string[]): string[] {
-  const resultingAddresses = l1ToL2AddressesToFinalize.slice().map(getAddress);
-  for (const address of addressesToEnsure) {
-    const checksummedAddress = getAddress(address);
-    if (!resultingAddresses.includes(checksummedAddress)) {
-      resultingAddresses.push(checksummedAddress);
-    }
-  }
-  return resultingAddresses;
-}
-
 export async function finalize(
   logger: winston.Logger,
   hubSigner: Signer,
   hubPoolClient: HubPoolClient,
   spokePoolClients: SpokePoolClientsByChain,
   configuredChainIds: number[],
-  l1ToL2AddressesToFinalize: string[],
   submitFinalizationTransactions: boolean,
   finalizationStrategy: FinalizationType
 ): Promise<void> {
@@ -176,7 +188,8 @@ export async function finalize(
 
   // Note: Could move this into a client in the future to manage # of calls and chunk calls based on
   // input byte length.
-  const finalizationsToBatch: { txn: Multicall2Call; crossChainMessage?: CrossChainMessage }[] = [];
+  const finalizerResponseTxns: { txn: Multicall2Call | AugmentedTransaction; crossChainMessage?: CrossChainMessage }[] =
+    [];
 
   // For each chain, delegate to a handler to look up any TokensBridged events and attempt finalization.
   await sdkUtils.mapAsync(configuredChainIds, async (chainId) => {
@@ -214,18 +227,21 @@ export async function finalize(
 
     const network = getNetworkName(chainId);
 
-    // For certain chains we always want to track certain addresses for finalization:
-    // If the chain needs an L1->L2 finalization, always track HubPool, AtomicDepositor. HubPool sends messages and
-    // tokens to the SpokePool, while the relayer rebalances ETH via the AtomicDepositor
-    if (sdkUtils.chainRequiresL1ToL2Finalization(chainId)) {
-      const addressesToEnsure = [
-        hubPoolClient.hubPool.address,
-        CONTRACT_ADDRESSES[hubChainId]?.atomicDepositor?.address,
-      ];
-      // Add the spoke pool address to the list of addresses to ensure.
-      addressesToEnsure.push(spokePoolClients[chainId].spokePool.address);
-      l1ToL2AddressesToFinalize = enrichL1ToL2AddressesToFinalize(l1ToL2AddressesToFinalize, addressesToEnsure);
-    }
+    // Some finalizer adapters query TokensBridged events on the L2 spoke pools to discover withdrawals that
+    // need to be finalized and will ignore the following address list. For others, this list comprises both the
+    // "sender" and "recipient" addresses we should look out for. Some bridging events don't let us query for the sender
+    // or the recipient so its important to track for both, even if that means more RPC requests.
+    // Always track HubPool, SpokePool, AtomicDepositor. HubPool sends messages and
+    // tokens to the SpokePool, while the relayer rebalances ETH via the AtomicDepositor.
+    const userSpecifiedAddresses: string[] = process.env.FINALIZER_WITHDRAWAL_TO_ADDRESSES
+      ? JSON.parse(process.env.FINALIZER_WITHDRAWAL_TO_ADDRESSES).map((address) => ethers.utils.getAddress(address))
+      : [];
+    const addressesToFinalize = [
+      hubPoolClient.hubPool.address,
+      spokePoolClients[chainId].spokePool.address,
+      CONTRACT_ADDRESSES[hubChainId]?.atomicDepositor?.address,
+      ...userSpecifiedAddresses,
+    ].map(getAddress);
 
     // We can subloop through the finalizers for each chain, and then execute the finalizer. For now, the
     // main reason for this is related to CCTP finalizations. We want to run the CCTP finalizer AND the
@@ -242,11 +258,12 @@ export async function finalize(
           hubSigner,
           hubPoolClient,
           client,
-          l1ToL2AddressesToFinalize
+          spokePoolClients[hubChainId],
+          addressesToFinalize
         );
 
         callData.forEach((txn, idx) => {
-          finalizationsToBatch.push({ txn, crossChainMessage: crossChainMessages[idx] });
+          finalizerResponseTxns.push({ txn, crossChainMessage: crossChainMessages[idx] });
         });
 
         totalWithdrawalsForChain += crossChainMessages.filter(({ type }) => type === "withdrawal").length;
@@ -287,132 +304,96 @@ export async function finalize(
       .map(([k]) => k)}`
   );
 
-  const txnClient = new TransactionClient(logger);
+  // @dev use multicaller client to execute batched txn to take advantage of its native txn simulation
+  // safety features. This only works because we assume all finalizer transactions are
+  // unpermissioned (i.e. msg.sender can be anyone). If this is not true for any chain then we'd need to use
+  // the TransactionClient.
+  const multicallerClient = new MultiCallerClient(logger);
+  let txnRefLookup: Record<number, string[]> = {};
+  try {
+    const finalizationsByChain = groupBy(
+      finalizerResponseTxns,
+      ({ crossChainMessage }) => crossChainMessage.destinationChainId
+    );
 
-  let gasEstimation = bnZero;
-  const batchGasLimit = BigNumber.from(10_000_000);
-  // @dev To avoid running into block gas limit in case the # of finalizations gets too high, keep a running
-  // counter of the approximate gas estimation and cut off the list of finalizations if it gets too high.
+    // @dev Here, we enqueueTransaction individual transactions right away, and we batch all multicalls into `multicallTxns` to enqueue as a single tx right after
+    for (const [chainId, finalizations] of Object.entries(finalizationsByChain)) {
+      const multicallTxns: Multicall2Call[] = [];
 
-  // Ensure each transaction would succeed in isolation.
-  const finalizations = await sdkUtils.filterAsync(finalizationsToBatch, async ({ txn: _txn, crossChainMessage }) => {
-    const txnToSubmit: AugmentedTransaction = {
-      contract: multicall2Lookup[crossChainMessage.destinationChainId],
-      chainId: crossChainMessage.destinationChainId,
-      method: "aggregate",
-      // aggregate() takes an array of tuples: [calldata: bytes, target: address].
-      args: [[_txn]],
-    };
-    const [{ reason, succeed, transaction }] = await txnClient.simulate([txnToSubmit]);
+      finalizations.forEach(({ txn }) => {
+        if (isAugmentedTransaction(txn)) {
+          // It's an AugmentedTransaction, enqueue directly
+          txn.nonMulticall = true; // cautiously enforce an invariant that should already be present
+          multicallerClient.enqueueTransaction(txn);
+        } else {
+          // It's a Multicall2Call, collect for batching
+          multicallTxns.push(txn);
+        }
+      });
 
-    if (succeed) {
-      // Increase running counter of estimated gas cost for batch finalization.
-      // gasLimit should be defined if succeed is True.
-      const updatedGasEstimation = gasEstimation.add(transaction.gasLimit);
-      if (updatedGasEstimation.lt(batchGasLimit)) {
-        gasEstimation = updatedGasEstimation;
-        return true;
-      } else {
-        return false;
-      }
-    }
-
-    // Simulation failed, log the reason and continue.
-    let message: string;
-    if (isDefined(crossChainMessage)) {
-      const { originationChainId, destinationChainId, type, l1TokenSymbol, amount } = crossChainMessage;
-      const originationNetwork = getNetworkName(originationChainId);
-      const destinationNetwork = getNetworkName(destinationChainId);
-      message = `Failed to estimate gas for ${originationNetwork} -> ${destinationNetwork} ${amount} ${l1TokenSymbol} ${type}.`;
-    } else {
-      // @dev Likely to be the 2nd part of a 2-stage withdrawal (i.e. retrieve() on the Polygon bridge adapter).
-      message = "Unknown finalizer simulation failure.";
-    }
-    logger.warn({ at: "finalizer", message, reason, txn: _txn });
-    return false;
-  });
-
-  if (finalizations.length > 0) {
-    // @dev use multicaller client to execute batched txn to take advantage of its native txn simulation
-    // safety features. This only works because we assume all finalizer transactions are
-    // unpermissioned (i.e. msg.sender can be anyone). If this is not true for any chain then we'd need to use
-    // the TransactionClient.
-    const multicallerClient = new MultiCallerClient(logger);
-    let txnHashLookup: Record<number, string[]> = {};
-    try {
-      const finalizationsByChain = groupBy(
-        finalizations,
-        ({ crossChainMessage }) => crossChainMessage.destinationChainId
-      );
-      for (const [chainId, finalizations] of Object.entries(finalizationsByChain)) {
-        const finalizerTxns = finalizations.map(({ txn }) => txn);
+      if (multicallTxns.length > 0) {
         const txnToSubmit: AugmentedTransaction = {
           contract: multicall2Lookup[Number(chainId)],
           chainId: Number(chainId),
           method: "aggregate",
-          args: [finalizerTxns],
-          gasLimit: gasEstimation,
+          args: [multicallTxns],
           gasLimitMultiplier: 2,
           unpermissioned: true,
-          message: `Batch finalized ${finalizerTxns.length} txns`,
-          mrkdwn: `Batch finalized ${finalizerTxns.length} txns`,
+          message: `Batch finalized ${multicallTxns.length} txns`,
+          mrkdwn: `Batch finalized ${multicallTxns.length} txns`,
         };
         multicallerClient.enqueueTransaction(txnToSubmit);
       }
-      txnHashLookup = await multicallerClient.executeTxnQueues(!submitFinalizationTransactions);
-    } catch (_error) {
-      const error = _error as Error;
-      logger.warn({
-        at: "Finalizer",
-        message: "Error creating aggregateTx",
-        reason: error.stack || error.message || error.toString(),
-        notificationPath: "across-error",
-        finalizations,
-      });
+    }
+    txnRefLookup = await multicallerClient.executeTxnQueues(!submitFinalizationTransactions);
+  } catch (_error) {
+    const error = _error as Error;
+    logger.warn({
+      at: "Finalizer",
+      message: "Error creating aggregateTx",
+      reason: error.stack || error.message || error.toString(),
+      notificationPath: "across-error",
+      finalizations: finalizerResponseTxns,
+    });
+    return;
+  }
+
+  const { transfers = [], misc = [] } = groupBy(
+    finalizerResponseTxns.filter(({ crossChainMessage }) => isDefined(crossChainMessage)),
+    ({ crossChainMessage: { type } }) => {
+      return type === "misc" ? "misc" : "transfers";
+    }
+  );
+
+  misc.forEach(({ crossChainMessage }) => {
+    const { originationChainId, destinationChainId, amount, l1TokenSymbol: symbol, type } = crossChainMessage;
+    // Required for tsc to be happy.
+    if (type !== "misc") {
       return;
     }
-
-    const { transfers = [], misc = [] } = groupBy(
-      finalizations.filter(({ crossChainMessage }) => isDefined(crossChainMessage)),
-      ({ crossChainMessage: { type } }) => {
-        return type === "misc" ? "misc" : "transfers";
-      }
-    );
-
-    misc.forEach(({ crossChainMessage }) => {
-      const { originationChainId, destinationChainId, amount, l1TokenSymbol: symbol, type } = crossChainMessage;
-      // Required for tsc to be happy.
-      if (type !== "misc") {
-        return;
-      }
-      const { miscReason } = crossChainMessage;
+    const { miscReason } = crossChainMessage;
+    const originationNetwork = getNetworkName(originationChainId);
+    const destinationNetwork = getNetworkName(destinationChainId);
+    const infoLogMessage =
+      amount && symbol ? `to support a ${originationNetwork} withdrawal of ${amount} ${symbol} 🔜` : "";
+    logger.info({
+      at: "Finalizer",
+      message: `Submitted ${miscReason} on ${destinationNetwork}`,
+      infoLogMessage,
+      txnRefList: txnRefLookup[destinationChainId]?.map((txnRef) => blockExplorerLink(txnRef, destinationChainId)),
+    });
+  });
+  transfers.forEach(
+    ({ crossChainMessage: { originationChainId, destinationChainId, type, amount, l1TokenSymbol: symbol } }) => {
       const originationNetwork = getNetworkName(originationChainId);
       const destinationNetwork = getNetworkName(destinationChainId);
-      const infoLogMessage =
-        amount && symbol ? `to support a ${originationNetwork} withdrawal of ${amount} ${symbol} 🔜` : "";
       logger.info({
         at: "Finalizer",
-        message: `Submitted ${miscReason} on ${destinationNetwork}`,
-        infoLogMessage,
-        transactionHashList: txnHashLookup[destinationChainId]?.map((txnHash) =>
-          blockExplorerLink(txnHash, destinationChainId)
-        ),
+        message: `Finalized ${originationNetwork} ${type} on ${destinationNetwork} for ${amount} ${symbol} 🪃`,
+        txnRefList: txnRefLookup[destinationChainId]?.map((txnRef) => blockExplorerLink(txnRef, destinationChainId)),
       });
-    });
-    transfers.forEach(
-      ({ crossChainMessage: { originationChainId, destinationChainId, type, amount, l1TokenSymbol: symbol } }) => {
-        const originationNetwork = getNetworkName(originationChainId);
-        const destinationNetwork = getNetworkName(destinationChainId);
-        logger.info({
-          at: "Finalizer",
-          message: `Finalized ${originationNetwork} ${type} on ${destinationNetwork} for ${amount} ${symbol} 🪃`,
-          transactionHashList: txnHashLookup[destinationChainId]?.map((txnHash) =>
-            blockExplorerLink(txnHash, destinationChainId)
-          ),
-        });
-      }
-    );
-  }
+    }
+  );
 }
 
 export async function constructFinalizerClients(
@@ -437,8 +418,8 @@ export async function constructFinalizerClients(
   if (configuredChainIds.length === 0) {
     throw new Error("No chains configured for finalizer");
   }
-  if (!configuredChainIds.includes(CHAIN_IDs.MAINNET)) {
-    configuredChainIds.push(CHAIN_IDs.MAINNET);
+  if (!configuredChainIds.includes(config.hubPoolChainId)) {
+    configuredChainIds.push(config.hubPoolChainId);
   }
   const spokePoolClients = await constructSpokePoolClientsWithLookback(
     logger,
@@ -466,15 +447,13 @@ async function updateFinalizerClients(clients: Clients) {
 export class FinalizerConfig extends DataworkerConfig {
   readonly maxFinalizerLookback: number;
   readonly chainsToFinalize: number[];
-  readonly addressesToMonitorForL1L2Finalizer: string[];
   readonly finalizationStrategy: FinalizationType;
 
   constructor(env: ProcessEnv) {
-    const { FINALIZER_MAX_TOKENBRIDGE_LOOKBACK, FINALIZER_CHAINS, L1_L2_FINALIZER_MONITOR_ADDRESS } = env;
+    const { FINALIZER_MAX_TOKENBRIDGE_LOOKBACK, FINALIZER_CHAINS } = env;
     super(env);
 
     this.chainsToFinalize = JSON.parse(FINALIZER_CHAINS ?? "[]");
-    this.addressesToMonitorForL1L2Finalizer = JSON.parse(L1_L2_FINALIZER_MONITOR_ADDRESS ?? "[]").map(getAddress);
 
     // `maxFinalizerLookback` is how far we fetch events from, modifying the search config's 'fromBlock'
     this.maxFinalizerLookback = Number(FINALIZER_MAX_TOKENBRIDGE_LOOKBACK ?? FINALIZER_TOKENBRIDGE_LOOKBACK);
@@ -520,8 +499,7 @@ export async function runFinalizer(_logger: winston.Logger, baseSigner: Signer):
           commonClients.hubPoolClient,
           spokePoolClients,
           config.chainsToFinalize.length === 0 ? availableChains : config.chainsToFinalize,
-          config.addressesToMonitorForL1L2Finalizer,
-          config.sendingFinalizationsEnabled,
+          config.sendingTransactionsEnabled,
           config.finalizationStrategy
         );
       } else {

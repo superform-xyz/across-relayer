@@ -1,7 +1,8 @@
-import { SpokePoolClient, TokenClient } from "../src/clients";
-import { MockConfigStoreClient, MockHubPoolClient } from "./mocks";
+import { SpokePoolClient } from "../src/clients";
+import { MockConfigStoreClient, MockHubPoolClient, SimpleMockTokenClient } from "./mocks";
 import { originChainId, destinationChainId, ZERO_ADDRESS } from "./constants";
 import {
+  BigNumber,
   Contract,
   SignerWithAddress,
   createSpyLogger,
@@ -12,6 +13,7 @@ import {
   expect,
   toBNWei,
   winston,
+  deployMulticall3,
 } from "./utils";
 
 describe("TokenClient: Token shortfall", async function () {
@@ -19,7 +21,7 @@ describe("TokenClient: Token shortfall", async function () {
   let erc20_2: Contract;
   let spokePoolClient_1: SpokePoolClient, spokePoolClient_2: SpokePoolClient;
   let owner: SignerWithAddress, spyLogger: winston.Logger;
-  let tokenClient: TokenClient; // tested
+  let tokenClient: SimpleMockTokenClient; // tested
   let spokePool1DeploymentBlock: number, spokePool2DeploymentBlock: number;
 
   const updateAllClients = async () => {
@@ -71,7 +73,11 @@ describe("TokenClient: Token shortfall", async function () {
     });
     hubPoolClient.setTokenMapping(l1Token_1.address, destinationChainId, erc20_2.address);
 
-    tokenClient = new TokenClient(spyLogger, owner.address, spokePoolClients, hubPoolClient);
+    // Deploy Multicall3 to the hardhat test networks.
+    await deployMulticall3(owner);
+
+    tokenClient = new SimpleMockTokenClient(spyLogger, owner.address, spokePoolClients, hubPoolClient);
+    tokenClient.setRemoteTokens([l1Token_1, erc20_2]);
   });
 
   it("Captures and tracks token shortfall", async function () {
@@ -82,7 +88,7 @@ describe("TokenClient: Token shortfall", async function () {
     const balance = toBNWei(69);
     await erc20_2.mint(owner.address, balance);
     await updateAllClients();
-    const depositId = 1;
+    const depositId = BigNumber.from(1);
     let needed = toBNWei(420);
     let shortfall = needed.sub(balance);
     tokenClient.captureTokenShortfall(destinationChainId, erc20_2.address, depositId, toBNWei(420));
@@ -93,7 +99,7 @@ describe("TokenClient: Token shortfall", async function () {
     expect(tokenShortFallData.deposits).to.deep.equal([depositId]);
 
     // A subsequent shortfall deposit of 42 should add to the token shortfall and append the deposit id as 351+42 = 393.
-    const depositId2 = 2;
+    const depositId2 = BigNumber.from(2);
 
     tokenClient.captureTokenShortfall(destinationChainId, erc20_2.address, depositId2, toBNWei(42));
     needed = needed.add(toBNWei(42));

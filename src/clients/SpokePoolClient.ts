@@ -2,9 +2,18 @@ import assert from "assert";
 import { ChildProcess, spawn } from "child_process";
 import { Contract } from "ethers";
 import { clients, utils as sdkUtils } from "@across-protocol/sdk";
-import { Log } from "../interfaces";
-import { CHAIN_MAX_BLOCK_LOOKBACK, RELAYER_DEFAULT_SPOKEPOOL_INDEXER } from "../common/Constants";
-import { EventSearchConfig, getNetworkName, isDefined, MakeOptional, winston } from "../utils";
+import { Log, DepositWithBlock } from "../interfaces";
+import { CHAIN_MAX_BLOCK_LOOKBACK, RELAYER_DEFAULT_SPOKEPOOL_LISTENER } from "../common/Constants";
+import {
+  EventSearchConfig,
+  getNetworkName,
+  isDefined,
+  MakeOptional,
+  winston,
+  getRelayEventKey,
+  getMessageHash,
+  spreadEventWithBlockNumber,
+} from "../utils";
 import { EventsAddedMessage, EventRemovedMessage } from "../utils/SuperstructUtils";
 
 export type SpokePoolClient = clients.SpokePoolClient;
@@ -20,7 +29,6 @@ type SpokePoolEventRemoved = {
 type SpokePoolEventsAdded = {
   blockNumber: number;
   currentTime: number;
-  oldestTime: number;
   nEvents: number; // Number of events.
   data: string;
 };
@@ -35,14 +43,13 @@ export function isSpokePoolEventRemoved(message: unknown): message is SpokePoolE
   return EventRemovedMessage.is(message);
 }
 
-export class IndexedSpokePoolClient extends clients.SpokePoolClient {
+export class IndexedSpokePoolClient extends clients.EVMSpokePoolClient {
   public readonly chain: string;
   public readonly indexerPath: string;
 
   private worker: ChildProcess;
   private pendingBlockNumber: number;
   private pendingCurrentTime: number;
-  private pendingOldestTime: number;
 
   private pendingEvents: Log[][];
   private pendingEventsRemoved: Log[];
@@ -62,11 +69,11 @@ export class IndexedSpokePoolClient extends clients.SpokePoolClient {
     super(logger, spokePool, hubPoolClient, chainId, deploymentBlock, eventSearchConfig);
 
     this.chain = getNetworkName(chainId);
-    this.indexerPath = opts.path ?? RELAYER_DEFAULT_SPOKEPOOL_INDEXER;
+    this.indexerPath = opts.path ?? RELAYER_DEFAULT_SPOKEPOOL_LISTENER;
 
     this.pendingBlockNumber = deploymentBlock;
     this.pendingCurrentTime = 0;
-    this.pendingEvents = this.queryableEventNames.map(() => []);
+    this.pendingEvents = this._queryableEventNames().map(() => []);
     this.pendingEventsRemoved = [];
 
     this.startWorker();
@@ -158,7 +165,7 @@ export class IndexedSpokePoolClient extends clients.SpokePoolClient {
 
     assert(isSpokePoolEventsAdded(message), `Expected ${this.chain} SpokePoolEventsAdded message`);
 
-    const { blockNumber, currentTime, oldestTime, nEvents, data } = message;
+    const { blockNumber, currentTime, nEvents, data } = message;
     if (nEvents > 0) {
       const pendingEvents = JSON.parse(data, sdkUtils.jsonReviverWithBigNumbers);
       assert(
@@ -174,7 +181,7 @@ export class IndexedSpokePoolClient extends clients.SpokePoolClient {
       });
 
       pendingEvents.forEach((event) => {
-        const eventIdx = this.queryableEventNames.indexOf(event.event);
+        const eventIdx = this._queryableEventNames().indexOf(event.event);
         assert(
           eventIdx !== -1 && event.removed === false,
           event.removed ? "Incorrectly received removed event" : `Unsupported event name (${event.event})`
@@ -186,9 +193,6 @@ export class IndexedSpokePoolClient extends clients.SpokePoolClient {
 
     this.pendingBlockNumber = blockNumber;
     this.pendingCurrentTime = currentTime;
-    if (!isDefined(this.pendingOldestTime) && oldestTime > 0) {
-      this.pendingOldestTime = oldestTime;
-    }
   }
 
   /**
@@ -198,7 +202,7 @@ export class IndexedSpokePoolClient extends clients.SpokePoolClient {
    */
   protected removeEvent(event: Log): boolean {
     let removed = false;
-    const eventIdx = this.queryableEventNames.indexOf(event.event);
+    const eventIdx = this._queryableEventNames().indexOf(event.event);
     const pendingEvents = this.pendingEvents[eventIdx];
 
     const { event: eventName, blockNumber, blockHash, transactionHash, transactionIndex, logIndex } = event;
@@ -229,11 +233,15 @@ export class IndexedSpokePoolClient extends clients.SpokePoolClient {
     // relayer from filling a deposit where it must wait for additional deposit confirmations. Note that this is
     // _unsafe_ to do ad-hoc, since it may interfere with some ongoing relayer computations relying on the
     // depositHashes object. If that's an acceptable risk then it might be preferable to simply assert().
-    if (eventName === "V3FundsDeposited") {
+    if (eventName === "V3FundsDeposited" || eventName === "FundsDeposited") {
       const { depositId } = event.args;
       assert(isDefined(depositId));
 
-      const depositHash = this.getDepositHash({ depositId, originChainId: this.chainId });
+      const depositEvent = {
+        ...spreadEventWithBlockNumber(event),
+        messageHash: event.args.messageHash ?? getMessageHash(event.args.message),
+      } as DepositWithBlock;
+      const depositHash = getRelayEventKey(depositEvent);
       if (isDefined(this.depositHashes[depositHash])) {
         delete this.depositHashes[depositHash];
         this.logger.warn({
@@ -270,7 +278,7 @@ export class IndexedSpokePoolClient extends clients.SpokePoolClient {
     this.pendingEventsRemoved = this.pendingEventsRemoved.filter((event) => !this.removeEvent(event));
 
     const events = eventsToQuery.map((eventName) => {
-      const eventIdx = this.queryableEventNames.indexOf(eventName);
+      const eventIdx = this._queryableEventNames().indexOf(eventName);
       assert(eventIdx !== -1);
 
       const pendingEvents = this.pendingEvents[eventIdx];
@@ -280,19 +288,9 @@ export class IndexedSpokePoolClient extends clients.SpokePoolClient {
       return pendingEvents;
     });
 
-    // Find the latest deposit Ids, and if there are no new events, fall back to already stored values.
-    const fundsDeposited = eventsToQuery.indexOf("V3FundsDeposited");
-    const [firstDepositId, latestDepositId] = [
-      events[fundsDeposited].at(0)?.args?.depositId ?? this.getDeposits().at(0) ?? 0,
-      events[fundsDeposited].at(-1)?.args?.depositId ?? this.getDeposits().at(-1) ?? 0,
-    ];
-
     return {
       success: true,
       currentTime: this.pendingCurrentTime,
-      oldestTime: this.pendingOldestTime,
-      firstDepositId,
-      latestDepositId,
       searchEndBlock: this.pendingBlockNumber,
       events,
     };

@@ -27,7 +27,7 @@ type DepositConfirmationConfig = {
 };
 
 export class RelayerConfig extends CommonConfig {
-  readonly externalIndexer: boolean;
+  readonly externalListener: boolean;
   readonly listenerPath: { [chainId: number]: string } = {};
   readonly inventoryConfig: InventoryConfig;
   readonly debugProfitability: boolean;
@@ -87,15 +87,15 @@ export class RelayerConfig extends CommonConfig {
       ACCEPT_INVALID_FILLS,
       MIN_DEPOSIT_CONFIRMATIONS,
       RELAYER_IGNORE_LIMITS,
-      RELAYER_EXTERNAL_INDEXER,
+      RELAYER_EXTERNAL_LISTENER,
       RELAYER_TRY_MULTICALL_CHAINS,
       RELAYER_LOGGING_INTERVAL = "30",
       RELAYER_MAINTENANCE_INTERVAL = "60",
     } = env;
     super(env);
 
-    // External indexing is dependent on looping mode being configured.
-    this.externalIndexer = this.pollingDelay > 0 && RELAYER_EXTERNAL_INDEXER === "true";
+    // External listeners are dependent on looping mode being configured.
+    this.externalListener = this.pollingDelay > 0 && RELAYER_EXTERNAL_LISTENER === "true";
 
     // Empty means all chains.
     this.relayerOriginChains = JSON.parse(RELAYER_ORIGIN_CHAINS ?? "[]");
@@ -171,8 +171,20 @@ export class RelayerConfig extends CommonConfig {
         chainId: string,
         rawTokenConfig: TokenBalanceConfig
       ): TokenBalanceConfig => {
-        const { targetPct, thresholdPct, unwrapWethThreshold, unwrapWethTarget, targetOverageBuffer } = rawTokenConfig;
-        const tokenConfig: TokenBalanceConfig = { targetPct, thresholdPct, targetOverageBuffer };
+        const {
+          targetPct,
+          thresholdPct,
+          unwrapWethThreshold,
+          unwrapWethTarget,
+          targetOverageBuffer,
+          withdrawExcessPeriod,
+        } = rawTokenConfig;
+        const tokenConfig: TokenBalanceConfig = {
+          targetPct,
+          thresholdPct,
+          targetOverageBuffer,
+          withdrawExcessPeriod,
+        };
 
         assert(
           targetPct !== undefined && thresholdPct !== undefined,
@@ -185,10 +197,13 @@ export class RelayerConfig extends CommonConfig {
         tokenConfig.targetPct = toBNWei(targetPct).div(100);
         tokenConfig.thresholdPct = toBNWei(thresholdPct).div(100);
 
+        tokenConfig.withdrawExcessPeriod = withdrawExcessPeriod;
+
         // Default to 150% the targetPct. targetOverageBuffer does not have to be defined so that no existing configs
         // are broken. This is a reasonable default because it allows the relayer to be a bit more flexible in
         // holding more tokens than the targetPct, but perhaps a better default is 100%
         tokenConfig.targetOverageBuffer = toBNWei(targetOverageBuffer ?? "1.5");
+        assert(tokenConfig.targetOverageBuffer.gte(toBNWei("1.0")), "targetOverageBuffer must be >= 1.0x");
 
         // For WETH, also consider any unwrap target/threshold.
         if (l1Token === TOKEN_SYMBOLS_MAP.WETH.symbol) {
@@ -206,9 +221,16 @@ export class RelayerConfig extends CommonConfig {
       Object.keys(rawTokenConfigs).forEach((l1Token) => {
         // If the l1Token is a symbol, resolve the correct address.
         const effectiveL1Token = ethersUtils.isAddress(l1Token)
-          ? l1Token
+          ? ethersUtils.getAddress(l1Token)
           : TOKEN_SYMBOLS_MAP[l1Token].addresses[this.hubPoolChainId];
         assert(effectiveL1Token !== undefined, `No token identified for ${l1Token}`);
+
+        // Filter inventory configuration by supported tokens, if specified.
+        const known = this.relayerTokens.includes(effectiveL1Token) || this.relayerTokens.length === 0;
+        if (!known) {
+          delete rawTokenConfigs[l1Token];
+          return;
+        }
 
         tokenConfigs[effectiveL1Token] ??= {};
         const hubTokenConfig = rawTokenConfigs[l1Token];
@@ -334,12 +356,12 @@ export class RelayerConfig extends CommonConfig {
       });
     }
 
-    const { RELAYER_SPOKEPOOL_INDEXER_PATH = Constants.RELAYER_DEFAULT_SPOKEPOOL_INDEXER } = process.env;
+    const { RELAYER_SPOKEPOOL_LISTENER_PATH = Constants.RELAYER_DEFAULT_SPOKEPOOL_LISTENER } = process.env;
 
     chainIds.forEach((chainId) => {
       minFillTime[chainId] = Number(process.env[`RELAYER_MIN_FILL_TIME_${chainId}`] ?? 0);
       listenerPath[chainId] =
-        process.env[`RELAYER_SPOKEPOOL_INDEXER_PATH_${chainId}`] ?? RELAYER_SPOKEPOOL_INDEXER_PATH;
+        process.env[`RELAYER_SPOKEPOOL_LISTENER_PATH_${chainId}`] ?? RELAYER_SPOKEPOOL_LISTENER_PATH;
     });
 
     // Only validate config for chains that the relayer cares about.

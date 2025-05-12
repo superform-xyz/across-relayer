@@ -9,6 +9,7 @@ import {
   getBlockForTimestamp,
   BlockFinder,
   isDefined,
+  EvmAddress,
 } from "../../utils";
 import { CONTRACT_ADDRESSES } from "../../common";
 import { BridgeTransactionDetails, BaseBridgeAdapter, BridgeEvents } from "./BaseBridgeAdapter";
@@ -18,19 +19,14 @@ export class LineaWethBridge extends BaseBridgeAdapter {
   protected atomicDepositor: Contract;
   protected blockFinder: BlockFinder;
 
-  constructor(
-    l2chainId: number,
-    hubChainId: number,
-    l1Signer: Signer,
-    l2SignerOrProvider: Signer | Provider,
-    _l1Token: string
-  ) {
-    // Lint Appeasement
-    _l1Token;
+  // We by default do not include a fee for Linea bridges.
+  protected bridgeFee = 0;
+
+  constructor(l2chainId: number, hubChainId: number, l1Signer: Signer, l2SignerOrProvider: Signer | Provider) {
     const { address: l1Address, abi: l1Abi } = CONTRACT_ADDRESSES[hubChainId].lineaMessageService;
     const { address: l2Address, abi: l2Abi } = CONTRACT_ADDRESSES[l2chainId].l2MessageService;
     const { address: atomicDepositorAddress, abi: atomicDepositorAbi } = CONTRACT_ADDRESSES[hubChainId].atomicDepositor;
-    super(l2chainId, hubChainId, l1Signer, l2SignerOrProvider, [atomicDepositorAddress]);
+    super(l2chainId, hubChainId, l1Signer, l2SignerOrProvider, [EvmAddress.from(atomicDepositorAddress)]);
 
     this.atomicDepositor = new Contract(atomicDepositorAddress, atomicDepositorAbi, l1Signer);
     this.l1Bridge = new Contract(l1Address, l1Abi, l1Signer);
@@ -38,27 +34,32 @@ export class LineaWethBridge extends BaseBridgeAdapter {
   }
 
   async constructL1ToL2Txn(
-    toAddress: string,
-    l1Token: string,
-    l2Token: string,
+    toAddress: EvmAddress,
+    l1Token: EvmAddress,
+    l2Token: EvmAddress,
     amount: BigNumber
   ): Promise<BridgeTransactionDetails> {
+    const bridgeCalldata = this.getL1Bridge().interface.encodeFunctionData("sendMessage", [
+      toAddress.toAddress(),
+      this.bridgeFee,
+      "0x",
+    ]);
     return Promise.resolve({
       contract: this.atomicDepositor,
-      method: "bridgeWethToLinea",
-      args: [toAddress, amount],
+      method: "bridgeWeth",
+      args: [this.l2chainId, amount, amount, bnZero, bridgeCalldata],
     });
   }
 
   async queryL1BridgeInitiationEvents(
-    l1Token: string,
-    fromAddress: string,
-    toAddress: string,
+    l1Token: EvmAddress,
+    fromAddress: EvmAddress,
+    toAddress: EvmAddress,
     eventConfig: EventSearchConfig
   ): Promise<BridgeEvents> {
     const events = await paginatedEventQuery(
       this.getL1Bridge(),
-      this.getL1Bridge().filters.MessageSent(undefined, toAddress),
+      this.getL1Bridge().filters.MessageSent(undefined, toAddress.toAddress()),
       eventConfig
     );
 
@@ -66,15 +67,15 @@ export class LineaWethBridge extends BaseBridgeAdapter {
     // those with 0 value.
     return {
       [this.resolveL2TokenAddress(l1Token)]: events
-        .map((event) => processEvent(event, "_value", "_to", "_from"))
-        .filter(({ amount }) => amount > bnZero),
+        .map((event) => processEvent(event, "_value"))
+        .filter(({ amount }) => amount.gt(bnZero)),
     };
   }
 
   async queryL2BridgeFinalizationEvents(
-    l1Token: string,
-    fromAddress: string,
-    toAddress: string,
+    l1Token: EvmAddress,
+    fromAddress: EvmAddress,
+    toAddress: EvmAddress,
     eventConfig: EventSearchConfig
   ): Promise<BridgeEvents> {
     const l2Provider = this.getL2Bridge().provider;
@@ -94,7 +95,7 @@ export class LineaWethBridge extends BaseBridgeAdapter {
     };
     const initiatedQueryResult = await paginatedEventQuery(
       this.getL1Bridge(),
-      this.getL1Bridge().filters.MessageSent(undefined, toAddress),
+      this.getL1Bridge().filters.MessageSent(undefined, toAddress.toAddress()),
       l1SearchConfig
     );
 
@@ -105,7 +106,7 @@ export class LineaWethBridge extends BaseBridgeAdapter {
     }
 
     const internalMessageHashes = initiatedQueryResult
-      .filter(({ args }) => args._value.gt(0))
+      .filter(({ args }) => args._value.gt(bnZero))
       .map(({ args }) => args._messageHash);
     const events = await paginatedEventQuery(
       this.getL2Bridge(),
@@ -121,11 +122,11 @@ export class LineaWethBridge extends BaseBridgeAdapter {
         // when the finalization event approaches the max look back value. In this case, we filter those out.
         return isDefined(queryEvent)
           ? {
-              ...processEvent(queryEvent, "_value", "_to", "_from"),
+              ...processEvent(queryEvent, "_value"),
               blockNumber: finalized.blockNumber,
-              transactionIndex: finalized.transactionIndex,
+              txnIndex: finalized.transactionIndex,
               logIndex: finalized.logIndex,
-              transactionHash: finalized.transactionHash,
+              txnRef: finalized.transactionHash,
             }
           : undefined;
       })

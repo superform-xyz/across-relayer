@@ -3,8 +3,17 @@ import * as sdk from "@across-protocol/sdk";
 export class BlockFinder extends sdk.utils.BlockFinder {}
 export type BlockFinderHints = sdk.utils.BlockFinderHints;
 
+export class AddressAggregator extends sdk.addressAggregator.AddressAggregator {}
+export const addressAdapters = sdk.addressAggregator.adapters;
+
 export class PriceClient extends sdk.priceClient.PriceClient {}
 export const { acrossApi, coingecko, defiLlama } = sdk.priceClient.adapters;
+
+export class Address extends sdk.utils.Address {}
+export class EvmAddress extends sdk.utils.EvmAddress {}
+export class SvmAddress extends sdk.utils.SvmAddress {}
+
+export const { fillStatusArray, populateV3Relay, relayFillStatus, getTimestampForBlock } = sdk.arch.evm;
 
 export const {
   assign,
@@ -19,12 +28,12 @@ export const {
   bnUint32Max,
   bnUint256Max,
   chainIsOPStack,
+  chainIsOrbit,
   chainIsArbitrum,
   chainIsProd,
   chainIsMatic,
   chainIsLinea,
   dedupArray,
-  fillStatusArray,
   fixedPointAdjustment,
   forEachAsync,
   formatEther,
@@ -51,10 +60,17 @@ export const {
   blockExplorerLinks,
   createShortHexString: shortenHexString,
   compareAddressesSimple,
-  getTokenInfo,
-  getL1TokenInfo,
+  getL1TokenAddress,
   getUsdcSymbol,
   Profiler,
+  getMessageHash,
+  getRelayEventKey,
+  toBytes32,
+  validateFillForDeposit,
+  toAddressType,
+  chainIsEvm,
+  ConvertDecimals,
+  getTokenInfo,
 } = sdk.utils;
 
 export const {

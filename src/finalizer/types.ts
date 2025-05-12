@@ -1,5 +1,5 @@
 import { Signer } from "ethers";
-import { HubPoolClient, SpokePoolClient } from "../clients";
+import { AugmentedTransaction, HubPoolClient, SpokePoolClient } from "../clients";
 import { Multicall2Call, winston } from "../utils";
 
 /**
@@ -28,14 +28,28 @@ export type CrossChainMessage = {
     }
 );
 
-export type FinalizerPromise = { callData: Multicall2Call[]; crossChainMessages: CrossChainMessage[] };
+export type FinalizerPromise = {
+  callData: (Multicall2Call | AugmentedTransaction)[];
+  crossChainMessages: CrossChainMessage[];
+};
 
 export interface ChainFinalizer {
   (
     logger: winston.Logger,
     signer: Signer,
     hubPoolClient: HubPoolClient,
-    spokePoolClient: SpokePoolClient,
+    l2SpokePoolClient: SpokePoolClient,
+    l1SpokePoolClient: SpokePoolClient,
     l1ToL2AddressesToFinalize: string[]
   ): Promise<FinalizerPromise>;
+}
+
+/**
+ * Type guard to check if a transaction object is an AugmentedTransaction.
+ * @param txn The transaction object to check.
+ * @returns True if the object is an AugmentedTransaction, false otherwise.
+ */
+export function isAugmentedTransaction(txn: Multicall2Call | AugmentedTransaction): txn is AugmentedTransaction {
+  // Check for the presence of the 'contract' property, unique to AugmentedTransaction
+  return txn != null && typeof txn === "object" && "contract" in txn;
 }

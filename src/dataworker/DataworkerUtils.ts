@@ -4,7 +4,7 @@ import { SpokePoolClient } from "../clients";
 import {
   ARWEAVE_TAG_BYTE_LIMIT,
   CONSERVATIVE_BUNDLE_FREQUENCY_SECONDS,
-  spokesThatHoldEthAndWeth,
+  spokesThatHoldNativeTokens,
 } from "../common/Constants";
 import { CONTRACT_ADDRESSES } from "../common/ContractAddresses";
 import {
@@ -26,8 +26,9 @@ import {
   isDefined,
   MerkleTree,
   Profiler,
-  TOKEN_SYMBOLS_MAP,
   winston,
+  getNativeTokenSymbol,
+  getWrappedNativeTokenAddress,
 } from "../utils";
 import { DataworkerClients } from "./DataworkerClientHelper";
 import {
@@ -124,23 +125,22 @@ export async function blockRangesAreInvalidForSpokeClients(
         const conservativeBundleFrequencySeconds = Number(
           process.env.CONSERVATIVE_BUNDLE_FREQUENCY_SECONDS ?? CONSERVATIVE_BUNDLE_FREQUENCY_SECONDS
         );
-        if (
-          spokePoolClient.eventSearchConfig.fromBlock > spokePoolClient.deploymentBlock &&
+        if (spokePoolClient.eventSearchConfig.fromBlock > spokePoolClient.deploymentBlock) {
           // @dev The maximum lookback window we need to evaluate expired deposits is the max fill deadline buffer,
           // which captures all deposits that newly expired, plus the bundle time (e.g. 1 hour) to account for the
           // maximum time it takes for a newly expired deposit to be included in a bundle. A conservative value for
           // this bundle time is 3 hours. This `conservativeBundleFrequencySeconds` buffer also ensures that all deposits
           // that are technically "expired", but have fills in the bundle, are also included. This can happen if a fill
           // is sent pretty late into the deposit's expiry period.
-          endBlockTimestamps[chainId] - spokePoolClient.getOldestTime() <
-            maxFillDeadlineBufferInBlockRange + conservativeBundleFrequencySeconds
-        ) {
-          return {
-            reason: `cannot evaluate all possible expired deposits; endBlockTimestamp ${
-              endBlockTimestamps[chainId]
-            } - spokePoolClient.getOldestTime ${spokePoolClient.getOldestTime()} < maxFillDeadlineBufferInBlockRange ${maxFillDeadlineBufferInBlockRange} + conservativeBundleFrequencySeconds ${conservativeBundleFrequencySeconds}`,
-            chainId,
-          };
+          const oldestTime = await spokePoolClient.getTimeAt(spokePoolClient.eventSearchConfig.fromBlock);
+          const expiryWindow = endBlockTimestamps[chainId] - oldestTime;
+          const safeExpiryWindow = maxFillDeadlineBufferInBlockRange + conservativeBundleFrequencySeconds;
+          if (expiryWindow < safeExpiryWindow) {
+            return {
+              reason: `cannot evaluate all possible expired deposits; endBlockTimestamp ${endBlockTimestamps[chainId]} - spokePoolClient.eventSearchConfig.fromBlock timestamp ${oldestTime} < maxFillDeadlineBufferInBlockRange ${maxFillDeadlineBufferInBlockRange} + conservativeBundleFrequencySeconds ${conservativeBundleFrequencySeconds}`,
+              chainId,
+            };
+          }
         }
       }
       // We must now assume that all newly expired deposits at the time of the bundle end blocks are contained within
@@ -176,7 +176,7 @@ export function _buildSlowRelayRoot(bundleSlowFillsV3: BundleSlowFills): {
   const sortedLeaves = [...slowRelayLeaves].sort((relayA, relayB) => {
     // Note: Smaller ID numbers will come first
     if (relayA.relayData.originChainId === relayB.relayData.originChainId) {
-      return relayA.relayData.depositId - relayB.relayData.depositId;
+      return relayA.relayData.depositId.lt(relayB.relayData.depositId) ? -1 : 1;
     } else {
       return relayA.relayData.originChainId - relayB.relayData.originChainId;
     }
@@ -237,6 +237,16 @@ export function _buildRelayerRefundRoot(
   Object.entries(combinedRefunds).forEach(([_repaymentChainId, refundsForChain]) => {
     const repaymentChainId = Number(_repaymentChainId);
     Object.entries(refundsForChain).forEach(([l2TokenAddress, refunds]) => {
+      // If the token cannot be mapped to any PoolRebalanceRoute, then the amount to return must be 0 since there
+      // is no way to send the token back to the HubPool.
+      if (!clients.hubPoolClient.l2TokenHasPoolRebalanceRoute(l2TokenAddress, repaymentChainId, endBlockForMainnet)) {
+        relayerRefundLeaves.push(
+          ..._getRefundLeaves(refunds, bnZero, repaymentChainId, l2TokenAddress, maxRefundCount)
+        );
+        return;
+      }
+      // If the token can be mapped to a PoolRebalanceRoute, then we need to calculate the amount to return based
+      // on its running balances.
       const l1TokenCounterpart = clients.hubPoolClient.getL1TokenForL2TokenAtBlock(
         l2TokenAddress,
         repaymentChainId,
@@ -255,8 +265,9 @@ export function _buildRelayerRefundRoot(
         runningBalances[repaymentChainId][l1TokenCounterpart]
       );
 
-      const _refundLeaves = _getRefundLeaves(refunds, amountToReturn, repaymentChainId, l2TokenAddress, maxRefundCount);
-      relayerRefundLeaves.push(..._refundLeaves);
+      relayerRefundLeaves.push(
+        ..._getRefundLeaves(refunds, amountToReturn, repaymentChainId, l2TokenAddress, maxRefundCount)
+      );
     });
   });
 
@@ -355,13 +366,14 @@ export function _getRefundLeaves(
  * @param chainId chain to check for WETH and ETH addresses
  * @returns WETH and ETH addresses.
  */
-function getWethAndEth(chainId: number): string[] {
+function getNativeTokens(chainId: number): string[] {
+  const nativeTokenSymbol = getNativeTokenSymbol(chainId);
   // Can't use TOKEN_SYMBOLS_MAP for ETH because it duplicates the WETH addresses, which is not correct for this use case.
-  const wethAndEth = [TOKEN_SYMBOLS_MAP.WETH.addresses[chainId], CONTRACT_ADDRESSES[chainId].eth.address];
-  if (wethAndEth.some((tokenAddress) => !isDefined(tokenAddress))) {
-    throw new Error(`WETH or ETH address not defined for chain ${chainId}`);
+  const nativeTokens = [getWrappedNativeTokenAddress(chainId), CONTRACT_ADDRESSES[chainId].nativeToken.address];
+  if (nativeTokens.some((tokenAddress) => !isDefined(tokenAddress))) {
+    throw new Error(`${nativeTokenSymbol} address not defined for chain ${chainId}`);
   }
-  return wethAndEth;
+  return nativeTokens;
 }
 /**
  * @notice Some SpokePools will contain balances of ETH and WETH, while others will only contain balances of WETH,
@@ -376,12 +388,12 @@ export function l2TokensToCountTowardsSpokePoolLeafExecutionCapital(
   l2TokenAddress: string,
   l2ChainId: number
 ): string[] {
-  if (!spokesThatHoldEthAndWeth.includes(l2ChainId)) {
+  if (!spokesThatHoldNativeTokens.includes(l2ChainId)) {
     return [l2TokenAddress];
   }
   // If we get to here, ETH and WETH addresses should be defined, or we'll throw an error.
-  const ethAndWeth = getWethAndEth(l2ChainId);
-  return ethAndWeth.includes(l2TokenAddress) ? ethAndWeth : [l2TokenAddress];
+  const nativeTokens = getNativeTokens(l2ChainId);
+  return nativeTokens.includes(l2TokenAddress) ? nativeTokens : [l2TokenAddress];
 }
 
 /**

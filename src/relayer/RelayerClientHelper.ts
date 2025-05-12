@@ -88,7 +88,7 @@ export async function constructRelayerClients(
       : undefined;
 
   let spokePoolClients: SpokePoolClientsByChain;
-  if (config.externalIndexer) {
+  if (config.externalListener) {
     spokePoolClients = Object.fromEntries(
       await sdkUtils.mapAsync(enabledChains ?? configStoreClient.getEnabledChains(), async (chainId) => {
         const opts = {
@@ -118,7 +118,11 @@ export async function constructRelayerClients(
       : Object.values(spokePoolClients).map(({ chainId }) => chainId);
   const acrossApiClient = new AcrossApiClient(logger, hubPoolClient, srcChainIds, config.relayerTokens);
 
-  const tokenClient = new TokenClient(logger, signerAddr, spokePoolClients, hubPoolClient);
+  const relayerTokens = sdkUtils.dedupArray([
+    ...config.relayerTokens,
+    ...Object.keys(config?.inventoryConfig?.tokenConfig ?? {}),
+  ]);
+  const tokenClient = new TokenClient(logger, signerAddr, spokePoolClients, hubPoolClient, relayerTokens);
 
   // If `relayerDestinationChains` is a non-empty array, then copy its value, otherwise default to all chains.
   const enabledChainIds = (
@@ -136,7 +140,8 @@ export async function constructRelayerClients(
     config.debugProfitability,
     config.relayerGasMultiplier,
     config.relayerMessageGasMultiplier,
-    config.relayerGasPadding
+    config.relayerGasPadding,
+    relayerTokens
   );
   await profitClient.update();
 
@@ -173,7 +178,7 @@ export async function constructRelayerClients(
     bundleDataClient,
     adapterManager,
     crossChainTransferClient,
-    !config.sendingRebalancesEnabled
+    !config.sendingTransactionsEnabled
   );
 
   const tryMulticallClient = new TryMulticallClient(logger, multiCallerClient.chunkSize, multiCallerClient.baseSigner);

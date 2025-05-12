@@ -1,14 +1,15 @@
-import * as zksync from "zksync-ethers";
 import { SpokePoolClient } from "../../src/clients";
 import { AdapterManager } from "../../src/clients/bridges";
-import { CONTRACT_ADDRESSES, chainIdsToCctpDomains } from "../../src/common";
+import { CONTRACT_ADDRESSES } from "../../src/common";
 import {
   bnToHex,
   getL2TokenAddresses,
   toBNWei,
   CHAIN_IDs,
   TOKEN_SYMBOLS_MAP,
-  cctpAddressToBytes32,
+  bnZero,
+  getCctpDomainForChainId,
+  EvmAddress,
 } from "../../src/utils";
 import { MockConfigStoreClient, MockHubPoolClient } from "../mocks";
 import {
@@ -45,8 +46,7 @@ let l1PolygonRootChainManager: FakeContract;
 let l1ArbitrumBridge: FakeContract;
 
 // ZkSync contracts
-let l1MailboxContract: FakeContract;
-let l1ZkSyncBridge: FakeContract;
+let l1BridgeHub: FakeContract;
 
 // Base contracts
 let l1BaseBridge: FakeContract;
@@ -95,19 +95,6 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
       thrown1 = true;
     }
     expect(thrown1).to.be.equal(true);
-
-    // Throws if there is a misconfiguration between L1 tokens and L2 tokens. This checks that the bot will error out
-    // if it tries to delete money in the bridge. configure hubpool to return the wrong token for Optimism
-
-    // bad config. map USDC on L1 to Arbitrum on L2. This is WRONG for chainID 10 and should error.
-    hubPoolClient.setTokenMapping(mainnetTokens["usdc"], 10, getL2TokenAddresses(mainnetTokens["usdc"])[42161]);
-    let thrown2 = false;
-    try {
-      await adapterManager.sendTokenCrossChain(relayer.address, CHAIN_IDs.OPTIMISM, mainnetTokens.usdc, amountToSend);
-    } catch (error) {
-      thrown2 = true;
-    }
-    expect(thrown2).to.be.equal(true);
   });
   it("Correctly sends tokens to chain: Optimism", async function () {
     const chainId = CHAIN_IDs.OPTIMISM;
@@ -150,8 +137,8 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
     );
     expect(l1CCTPTokenMessager.depositForBurn).to.have.been.calledWith(
       amountToSend, // amount
-      chainIdsToCctpDomains[chainId], // destinationDomain
-      cctpAddressToBytes32(relayer.address).toLowerCase(), // recipient
+      getCctpDomainForChainId(chainId), // destinationDomain
+      EvmAddress.from(relayer.address).toBytes32(), // recipient
       mainnetTokens.usdc // token
     );
 
@@ -174,11 +161,17 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
 
     // Weth is not directly sendable over the canonical bridge. Rather, we should see a call against the atomic depositor.
     await adapterManager.sendTokenCrossChain(relayer.address, chainId, mainnetTokens.weth, amountToSend);
-    expect(l1AtomicDepositor.bridgeWethToOvm).to.have.been.calledWith(
-      relayer.address, // to
+    const bridgeCalldata = l1OptimismBridge.interface.encodeFunctionData("depositETHTo", [
+      relayer.address,
+      l2Gas,
+      "0x",
+    ]);
+    expect(l1AtomicDepositor.bridgeWeth).to.have.been.calledWith(
+      chainId, // chainId
       amountToSend, // amount
-      l2Gas, // l2Gas
-      chainId // chainId
+      amountToSend,
+      bnZero,
+      bridgeCalldata
     );
   });
 
@@ -196,8 +189,8 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
     );
     expect(l1CCTPTokenMessager.depositForBurn).to.have.been.calledWith(
       amountToSend, // amount
-      chainIdsToCctpDomains[chainId], // destinationDomain
-      cctpAddressToBytes32(relayer.address).toLowerCase(), // recipient
+      getCctpDomainForChainId(chainId), // destinationDomain
+      EvmAddress.from(relayer.address).toBytes32(), // recipient
       mainnetTokens.usdc // token
     );
 
@@ -218,9 +211,13 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
 
     // Weth is not directly sendable over the canonical bridge. Rather, we should see a call against the atomic depositor.
     await adapterManager.sendTokenCrossChain(relayer.address, chainId, mainnetTokens.weth, amountToSend);
-    expect(l1AtomicDepositor.bridgeWethToPolygon).to.have.been.calledWith(
-      relayer.address, // to
-      amountToSend // amount
+    const bridgeCalldata = l1PolygonRootChainManager.interface.encodeFunctionData("depositEtherFor", [relayer.address]);
+    expect(l1AtomicDepositor.bridgeWeth).to.have.been.calledWith(
+      chainId,
+      amountToSend, // amount
+      amountToSend,
+      bnZero,
+      bridgeCalldata
     );
   });
 
@@ -244,8 +241,8 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
     );
     expect(l1CCTPTokenMessager.depositForBurn).to.have.been.calledWith(
       amountToSend, // amount
-      chainIdsToCctpDomains[chainId], // destinationDomain
-      cctpAddressToBytes32(relayer.address).toLowerCase(), // recipient
+      getCctpDomainForChainId(chainId), // destinationDomain
+      EvmAddress.from(relayer.address).toBytes32(), // recipient
       mainnetTokens.usdc // token
     );
 
@@ -282,7 +279,16 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
 
   it("Correctly sends tokens to chain: zkSync", async function () {
     const chainId = CHAIN_IDs.ZK_SYNC;
-    l1MailboxContract.l2TransactionBaseCost.returns(toBNWei("0.2"));
+    const bridgeParams = {
+      chainId: toBN(324),
+      mintValue: bnZero,
+      l2Value: bnZero,
+      l2GasLimit: toBN(2000000),
+      l2GasPerPubdataByteLimit: toBN(800),
+      refundRecipient: relayer.address,
+      secondBridgeAddress: CONTRACT_ADDRESSES[CHAIN_IDs.MAINNET].zkStackSharedBridge.address, // Shared bridge address
+      secondBridgeValue: bnZero,
+    };
     //  ERC20 tokens:
     await adapterManager.sendTokenCrossChain(
       relayer.address,
@@ -292,35 +298,42 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
       false,
       TOKEN_SYMBOLS_MAP["USDC.e"].addresses[chainId]
     );
-    expect(l1ZkSyncBridge.deposit).to.have.been.calledWith(
-      relayer.address, // user
-      mainnetTokens.usdc, // root token
-      amountToSend, // deposit data. bytes encoding of the amount to send.
-      2_000_000, // l2 gas limit, default is 2mil if on hardhat network
-      zksync.utils.REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_LIMIT // gasPerPubdataLimit
-    );
-    expect(l1ZkSyncBridge.deposit).to.have.been.calledWithValue(toBNWei("0.2"));
+    expect(l1BridgeHub.requestL2TransactionTwoBridges).to.have.been.calledWith({
+      ...bridgeParams,
+      secondBridgeCalldata: ethers.utils.defaultAbiCoder.encode(
+        ["address", "uint256", "address"],
+        [mainnetTokens.usdc, amountToSend, relayer.address]
+      ),
+    });
 
     await adapterManager.sendTokenCrossChain(relayer.address, chainId, mainnetTokens.wbtc, amountToSend);
-    expect(l1ZkSyncBridge.deposit).to.have.been.calledWith(
-      relayer.address, // user
-      mainnetTokens.wbtc, // root token
-      amountToSend, // deposit data. bytes encoding of the amount to send.
-      2_000_000, // l2 gas limit, default is 2mil if on hardhat network
-      zksync.utils.REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_LIMIT // gasPerPubdataLimit
-    );
-    expect(l1ZkSyncBridge.deposit).to.have.been.calledWithValue(toBNWei("0.2"));
+    expect(l1BridgeHub.requestL2TransactionTwoBridges).to.have.been.calledWith({
+      ...bridgeParams,
+      secondBridgeCalldata: ethers.utils.defaultAbiCoder.encode(
+        ["address", "uint256", "address"],
+        [mainnetTokens.wbtc, amountToSend, relayer.address]
+      ),
+    });
+
+    // Check that value is sent when the bridge hub returns a base cost.
+    l1BridgeHub.l2TransactionBaseCost.returns(toBNWei("0.2"));
+    await adapterManager.sendTokenCrossChain(relayer.address, chainId, mainnetTokens.wbtc, amountToSend);
+    expect(l1BridgeHub.requestL2TransactionTwoBridges).to.have.been.calledWithValue(toBNWei("0.2"));
 
     // Weth is not directly sendable over the canonical bridge. Rather, we should see a call against the atomic depositor.
     await adapterManager.sendTokenCrossChain(relayer.address, chainId, mainnetTokens.weth, amountToSend);
-    expect(l1AtomicDepositor.bridgeWethToZkSync).to.have.been.calledWith(
-      relayer.address,
+    const fee = toBNWei("0.2");
+    const bridgeCalldata = l1BridgeHub.interface.encodeFunctionData("requestL2TransactionDirect", [
+      [chainId, amountToSend.add(fee), relayer.address, amountToSend, "0x", 2_000_000, 800, [], relayer.address],
+    ]);
+    expect(l1AtomicDepositor.bridgeWeth).to.have.been.calledWith(
+      chainId,
+      amountToSend.add(fee),
       amountToSend,
-      2_000_000,
-      zksync.utils.REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_LIMIT,
-      relayer.address
+      bnZero,
+      bridgeCalldata
     );
-    expect(l1AtomicDepositor.bridgeWethToZkSync).to.have.been.calledWithValue(toBN(0));
+    expect(l1AtomicDepositor.bridgeWeth).to.have.been.calledWithValue(toBN(0));
   });
   it("Correctly sends tokens to chain: Base", async function () {
     const chainId = CHAIN_IDs.BASE;
@@ -336,8 +349,8 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
     );
     expect(l1CCTPTokenMessager.depositForBurn).to.have.been.calledWith(
       amountToSend, // amount
-      chainIdsToCctpDomains[chainId], // destinationDomain
-      cctpAddressToBytes32(relayer.address).toLowerCase(), // recipient
+      getCctpDomainForChainId(chainId), // destinationDomain
+      EvmAddress.from(relayer.address).toBytes32(), // recipient
       mainnetTokens.usdc // token
     );
 
@@ -379,11 +392,17 @@ describe("AdapterManager: Send tokens cross-chain", async function () {
 
     // Weth is not directly sendable over the canonical bridge. Rather, we should see a call against the atomic depositor.
     await adapterManager.sendTokenCrossChain(relayer.address, chainId, mainnetTokens.weth, amountToSend);
-    expect(l1AtomicDepositor.bridgeWethToOvm).to.have.been.calledWith(
-      relayer.address, // to
+    const bridgeCalldata = l1BaseBridge.interface.encodeFunctionData("depositETHTo", [
+      relayer.address,
+      adapterManager.adapters[chainId].bridges[mainnetTokens.weth].l2Gas,
+      "0x",
+    ]);
+    expect(l1AtomicDepositor.bridgeWeth).to.have.been.calledWith(
+      chainId, // chainId
       amountToSend, // amount
-      l2Gas, // l2Gas
-      chainId // chainId
+      amountToSend,
+      bnZero,
+      bridgeCalldata
     );
   });
 });
@@ -433,8 +452,7 @@ async function constructChainSpecificFakes() {
   );
 
   // zkSync contracts
-  l1ZkSyncBridge = await makeFake("zkSyncDefaultErc20Bridge", CONTRACT_ADDRESSES[1].zkSyncDefaultErc20Bridge.address);
-  l1MailboxContract = await makeFake("zkSyncMailbox", CONTRACT_ADDRESSES[1].zkSyncMailbox.address);
+  l1BridgeHub = await makeFake("zkStackBridgeHub", CONTRACT_ADDRESSES[1].zkStackBridgeHub.address);
 
   // Base contracts
   l1BaseBridge = await makeFake("ovmStandardBridge_8453", CONTRACT_ADDRESSES[1].ovmStandardBridge_8453.address);

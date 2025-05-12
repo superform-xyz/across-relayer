@@ -6,6 +6,7 @@ import { CHAIN_CACHE_FOLLOW_DISTANCE, DEFAULT_NO_TTL_DISTANCE } from "../common"
 import { delay, getOriginFromURL, Logger } from "./";
 import { getRedisCache } from "./RedisUtils";
 import { isDefined } from "./TypeGuards";
+import * as viem from "viem";
 
 export const defaultTimeout = 60 * 1000;
 export class RetryProvider extends sdkProviders.RetryProvider {}
@@ -31,6 +32,23 @@ export function getCachedProvider(chainId: number, redisEnabled = true): RetryPr
   return providerCache[getProviderCacheKey(chainId, redisEnabled)];
 }
 
+export function isJsonRpcError(response: unknown): { code: number; message: string; data?: unknown } | undefined {
+  if (!sdkProviders.RpcError.is(response)) {
+    return;
+  }
+
+  try {
+    const error = JSON.parse(response.body);
+    if (!sdkProviders.JsonRpcError.is(error)) {
+      return;
+    }
+
+    return error.error;
+  } catch {
+    return;
+  }
+}
+
 /**
  * Return the env-defined quorum configured for `chainId`, or 1 if no quorum has been defined.
  * @param chainId Chain ID to query for quorum.
@@ -38,6 +56,22 @@ export function getCachedProvider(chainId: number, redisEnabled = true): RetryPr
  */
 export function getChainQuorum(chainId: number): number {
   return Number(process.env[`NODE_QUORUM_${chainId}`] || process.env.NODE_QUORUM || "1");
+}
+
+/**
+ * Permit env-based HTTP headers to be specified.
+ * RPC_PROVIDER_<provider>_<chainId>_HEADERS=auth
+ * RPC_PROVIDER_<provider>_<chainId>_HEADER_AUTH=xxx-auth-header
+ */
+export function getProviderHeaders(provider: string, chainId: number): { [header: string]: string } | undefined {
+  let headers: { [k: string]: string };
+  const _headers = process.env[`RPC_PROVIDER_${provider}_${chainId}_HEADERS`];
+  _headers?.split(",").forEach((header) => {
+    headers ??= {};
+    headers[header] = process.env[`RPC_PROVIDER_${provider}_${chainId}_HEADER_${header.toUpperCase()}`];
+  });
+
+  return headers;
 }
 
 /**
@@ -149,18 +183,21 @@ export async function getProvider(
 
   // See ethers ConnectionInfo for field descriptions.
   // https://docs.ethers.org/v5/api/utils/web/#ConnectionInfo
-  const constructorArgumentLists = getNodeUrlList(chainId, nodeQuorumThreshold).map(
-    (nodeUrl): [ethers.utils.ConnectionInfo, number] => [
-      {
-        url: nodeUrl,
+
+  const constructorArgumentLists = Object.entries(getNodeUrlList(chainId, nodeQuorumThreshold)).map(
+    ([provider, url]): [ethers.utils.ConnectionInfo, number] => {
+      const config = {
+        url,
+        headers: getProviderHeaders(provider, chainId),
         timeout,
         allowGzip: true,
         throttleSlotInterval: 1, // Effectively disables ethers' internal backoff algorithm.
         throttleCallback: rpcRateLimited({ nodeMaxConcurrency, logger }),
         errorPassThrough: true,
-      },
-      chainId,
-    ]
+      };
+
+      return [config, chainId];
+    }
   );
 
   const provider = new RetryProvider(
@@ -185,14 +222,49 @@ export async function getProvider(
   return provider;
 }
 
+/**
+ * @notice Returns a Viem custom transport that can be used to create a Viem client from our customized Ethers
+ * provider. This allows us to send requests through our RetryProvider that need to be handled by Viem SDK's.
+ */
+export function createViemCustomTransportFromEthersProvider(providerChainId: number): viem.CustomTransport {
+  return viem.custom(
+    {
+      async request({ method, params }) {
+        const provider = getCachedProvider(providerChainId, true);
+        try {
+          return await provider.send(method, params);
+        } catch (error: any) {
+          // Ethers encodes RPC errors differently than Viem expects it so if the error is a JSON RPC error,
+          // decode it in a way that Viem can gracefully handle.
+          if (isJsonRpcError(error)) {
+            throw error.error;
+          } else {
+            throw error;
+          }
+        }
+      },
+    },
+    {
+      // Viem has many native options that we can use to replicate our ethers' RetryProvider but the easiest
+      // way to  migrate for now is to force all requests through our RetryProvider and disable all retry, quorum,
+      // caching, and other logic in the Viem transport.
+      retryCount: 0,
+    }
+  );
+}
+
 export function getWSProviders(chainId: number, quorum?: number): ethers.providers.WebSocketProvider[] {
   quorum ??= getChainQuorum(chainId);
   const urls = getNodeUrlList(chainId, quorum, "wss");
-  return urls.map((url) => new ethers.providers.WebSocketProvider(url));
+  return Object.values(urls).map((url) => new ethers.providers.WebSocketProvider(url));
 }
 
-export function getNodeUrlList(chainId: number, quorum = 1, transport: sdkProviders.RPCTransport = "https"): string[] {
-  const resolveUrls = (): string[] => {
+export function getNodeUrlList(
+  chainId: number,
+  quorum = 1,
+  transport: sdkProviders.RPCTransport = "https"
+): { [provider: string]: string } {
+  const resolveUrls = (): { [provider: string]: string } => {
     const [envPrefix, providerPrefix] =
       transport === "https" ? ["RPC_PROVIDERS", "RPC_PROVIDER"] : ["RPC_WS_PROVIDERS", "RPC_WS_PROVIDER"];
 
@@ -201,23 +273,25 @@ export function getNodeUrlList(chainId: number, quorum = 1, transport: sdkProvid
       throw new Error(`No RPC providers defined for chainId ${chainId}`);
     }
 
-    const nodeUrls = providers.split(",").map((provider) => {
-      // If no specific RPC endpoint is identified for this provider, try to
-      // to infer the endpoint name based on predefined chain definitions.
-      const apiKey = process.env[`RPC_PROVIDER_KEY_${provider}`];
-      const envVar = `${providerPrefix}_${provider}_${chainId}`;
-      let url = process.env[envVar];
-      if (!isDefined(url) && isDefined(apiKey) && sdkProviders.isSupportedProvider(provider)) {
-        url = sdkProviders.getURL(provider, chainId, apiKey, transport);
-      }
+    const nodeUrls = Object.fromEntries(
+      providers.split(",").map((provider) => {
+        // If no specific RPC endpoint is identified for this provider, try to
+        // to infer the endpoint name based on predefined chain definitions.
+        const apiKey = process.env[`RPC_PROVIDER_KEY_${provider}`];
+        const envVar = `${providerPrefix}_${provider}_${chainId}`;
+        let url = process.env[envVar];
+        if (!isDefined(url) && isDefined(apiKey) && sdkProviders.isSupportedProvider(provider)) {
+          url = sdkProviders.getURL(provider, chainId, apiKey, transport);
+        }
 
-      if (url === undefined) {
-        throw new Error(`Missing RPC provider URL for chain ${chainId} (${envVar})`);
-      }
-      return url;
-    });
+        if (url === undefined) {
+          throw new Error(`Missing RPC provider URL for chain ${chainId} (${envVar})`);
+        }
+        return [provider, url];
+      })
+    );
 
-    if (nodeUrls.length === 0) {
+    if (Object.keys(nodeUrls).length === 0) {
       throw new Error(`Missing configuration for chainId ${chainId} providers (${providers})`);
     }
 
@@ -225,7 +299,7 @@ export function getNodeUrlList(chainId: number, quorum = 1, transport: sdkProvid
   };
 
   const nodeUrls = resolveUrls();
-  if (nodeUrls.length < quorum) {
+  if (Object.keys(nodeUrls).length < quorum) {
     throw new Error(`Insufficient RPC providers for chainId ${chainId} to meet quorum (minimum ${quorum} required)`);
   }
 

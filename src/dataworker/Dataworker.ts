@@ -19,6 +19,7 @@ import {
   getEndBlockBuffers,
   _buildPoolRebalanceRoot,
   ERC20,
+  getTokenInfo,
 } from "../utils";
 import {
   ProposedRootBundle,
@@ -31,6 +32,7 @@ import {
   SlowFillLeaf,
   FillStatus,
 } from "../interfaces";
+import { DataworkerConfig } from "./DataworkerConfig";
 import { DataworkerClients } from "./DataworkerClientHelper";
 import { SpokePoolClient, BalanceAllocator, BundleDataClient } from "../clients";
 import * as PoolRebalanceUtils from "./PoolRebalanceUtils";
@@ -54,6 +56,7 @@ import {
   BundleSlowFills,
   ExpiredDepositsToRefundV3,
 } from "../interfaces/BundleData";
+import { convertRelayDataParamsToBytes32 } from "../utils/DepositUtils";
 
 // Internal error reasons for labeling a pending root bundle as "invalid" that we don't want to submit a dispute
 // for. These errors are due to issues with the dataworker configuration, instead of with the pending root
@@ -61,6 +64,9 @@ import {
 // level log for.
 const IGNORE_DISPUTE_REASONS = new Set(["bundle-end-block-buffer"]);
 const ERROR_DISPUTE_REASONS = new Set(["insufficient-dataworker-lookback", "out-of-date-config-store-version"]);
+
+const { getMessageHash, getRelayEventKey } = sdkUtils;
+const { getAddress } = ethersUtils;
 
 // Create a type for storing a collection of roots
 type SlowRootBundle = {
@@ -92,23 +98,26 @@ type PoolRebalanceRootCache = Record<string, PoolRebalanceRoot>;
 export class Dataworker {
   rootCache: PoolRebalanceRootCache = {};
 
+  blockRangeEndBlockBuffer: { [chainId: number]: number };
+
   // eslint-disable-next-line no-useless-constructor
   constructor(
     readonly logger: winston.Logger,
+    readonly config: DataworkerConfig,
     readonly clients: DataworkerClients,
     readonly chainIdListForBundleEvaluationBlockNumbers: number[],
     readonly maxRefundCountOverride: number | undefined,
     readonly maxL1TokenCountOverride: number | undefined,
-    readonly blockRangeEndBlockBuffer: { [chainId: number]: number } = {},
     readonly spokeRootsLookbackCount = 0,
     readonly bufferToPropose = 0,
     readonly forceProposal = false,
     readonly forceBundleRange?: [number, number][]
   ) {
+    this.blockRangeEndBlockBuffer = clients.bundleDataClient.blockRangeEndBlockBuffer;
     if (
       maxRefundCountOverride !== undefined ||
       maxL1TokenCountOverride !== undefined ||
-      Object.keys(blockRangeEndBlockBuffer).length > 0
+      Object.keys(this.blockRangeEndBlockBuffer).length > 0
     ) {
       this.logger.debug({
         at: "Dataworker#Constructor",
@@ -240,7 +249,7 @@ export class Dataworker {
         shouldWait: true,
         poolRebalanceLeafExecutionBlocks,
         mainnetBundleEndBlock,
-        mostRecentProposedRootBundle: mostRecentProposedRootBundle.transactionHash,
+        mostRecentProposedRootBundle: mostRecentProposedRootBundle.txnRef,
         expectedPoolRebalanceLeaves,
         executedPoolRebalanceLeaves: executedPoolRebalanceLeaves.length,
       };
@@ -258,7 +267,7 @@ export class Dataworker {
         poolRebalanceLeafExecutionBlocks,
         mainnetBundleEndBlock,
         minimumMainnetBundleEndBlockToPropose,
-        mostRecentProposedRootBundle: mostRecentProposedRootBundle.transactionHash,
+        mostRecentProposedRootBundle: mostRecentProposedRootBundle.txnRef,
       };
     }
   }
@@ -438,7 +447,7 @@ export class Dataworker {
     // 4. Propose roots to HubPool contract.
     this.logger.debug({
       at: "Dataworker#propose",
-      message: "Enqueing new root bundle proposal txn",
+      message: "Enqueuing new root bundle proposal txn",
       blockRangesForProposal,
       poolRebalanceLeavesCount: rootBundleData.poolRebalanceLeaves.length,
       poolRebalanceRoot: rootBundleData.poolRebalanceTree.getHexRoot(),
@@ -1078,7 +1087,7 @@ export class Dataworker {
               message:
                 "Cannot validate bundle with insufficient event data. Set a larger DATAWORKER_FAST_LOOKBACK_COUNT",
               invalidBlockRanges,
-              bundleTxn: matchingRootBundle.transactionHash,
+              bundleTxn: matchingRootBundle.txnRef,
             });
             continue;
           }
@@ -1098,22 +1107,21 @@ export class Dataworker {
               chainId,
               rootBundleRelay,
               mainnetRootBundleBlock: matchingRootBundle.blockNumber,
-              mainnetRootBundleTxn: matchingRootBundle.transactionHash,
+              mainnetRootBundleTxn: matchingRootBundle.txnRef,
               publishedSlowRelayRoot: rootBundleRelay.slowRelayRoot,
               constructedSlowRelayRoot: tree.getHexRoot(),
             });
             continue;
           }
 
-          // Filter out slow fill leaves for other chains and also expired deposits.
-          const currentTime = client.getCurrentTime();
-          const leavesForChain = leaves.filter(
-            (leaf) => leaf.chainId === chainId && leaf.relayData.fillDeadline >= currentTime
-          );
-          const unexecutedLeaves = leavesForChain.filter((leaf) => {
+          const unexecutedLeaves = leaves.filter((leaf) => {
+            // Filter out slow fill leaves for other chains.
+            if (leaf.chainId !== chainId) {
+              return false;
+            }
             const executedLeaf = slowFillsForChain.find(
               (event) =>
-                event.originChainId === leaf.relayData.originChainId && event.depositId === leaf.relayData.depositId
+                event.originChainId === leaf.relayData.originChainId && event.depositId.eq(leaf.relayData.depositId)
             );
 
             // Only return true if no leaf was found in the list of executed leaves.
@@ -1144,12 +1152,24 @@ export class Dataworker {
     submitExecution: boolean,
     rootBundleId?: number
   ): Promise<void> {
+    const currentTime = client.getCurrentTime();
+
     // Ignore slow fill leaves for deposits with messages as these messages might be very expensive to execute.
     // The original depositor can always execute these and pay for the gas themselves.
     const leaves = _leaves.filter((leaf) => {
       const {
-        relayData: { depositor, recipient, message },
+        relayData: { depositor, recipient, message, fillDeadline },
       } = leaf;
+
+      if (fillDeadline < currentTime) {
+        this.logger.debug({
+          at: "Dataworker#_executeSlowFillLeaf",
+          message: "Ignoring slow fill leaf with expired fill deadline",
+          fillDeadline,
+          currentTime,
+        });
+        return false;
+      }
 
       // If there is a message, we ignore the leaf and log an error.
       if (!sdk.utils.isMessageEmpty(message)) {
@@ -1164,13 +1184,8 @@ export class Dataworker {
         return false;
       }
 
-      const ignoredAddresses = JSON.parse(process.env.IGNORED_ADDRESSES ?? "[]").map((address) =>
-        ethersUtils.getAddress(address)
-      );
-      if (
-        ignoredAddresses?.includes(ethersUtils.getAddress(depositor)) ||
-        ignoredAddresses?.includes(ethersUtils.getAddress(recipient))
-      ) {
+      const { addressFilter } = this.config;
+      if (addressFilter?.has(getAddress(depositor)) || addressFilter?.has(getAddress(recipient))) {
         this.logger.warn({
           at: "Dataworker#_executeSlowFillLeaf",
           message: "Ignoring slow fill.",
@@ -1190,21 +1205,17 @@ export class Dataworker {
 
     const sortedFills = client.getFills();
     const latestFills = leaves.map((slowFill) => {
-      const { relayData, chainId: slowFillChainId } = slowFill;
+      const { relayData, chainId: destinationChainId } = slowFill;
+      const messageHash = getMessageHash(relayData.message);
 
       // Start with the most recent fills and search backwards.
-      const fill = _.findLast(sortedFills, (fill) => {
-        if (
-          !(
-            fill.depositId === relayData.depositId &&
-            fill.originChainId === relayData.originChainId &&
-            sdkUtils.getRelayDataHash(fill, chainId) === sdkUtils.getRelayDataHash(relayData, slowFillChainId)
-          )
-        ) {
-          return false;
-        }
-        return true;
-      });
+      const fill = _.findLast(
+        sortedFills,
+        (fill) =>
+          fill.depositId.eq(relayData.depositId) &&
+          fill.originChainId === relayData.originChainId &&
+          getRelayEventKey(fill) === getRelayEventKey({ ...relayData, messageHash, destinationChainId })
+      );
 
       return fill;
     });
@@ -1221,12 +1232,7 @@ export class Dataworker {
           // @dev check if there's been a duplicate leaf execution and if so, then exit early.
           // Since this function is happening near the end of the dataworker run and leaf executions are
           // relatively infrequent, the additional RPC latency and cost is acceptable.
-          const fillStatus = await sdkUtils.relayFillStatus(
-            client.spokePool,
-            slowFill.relayData,
-            "latest",
-            destinationChainId
-          );
+          const fillStatus = await client.relayFillStatus(slowFill.relayData, "latest");
           if (fillStatus === FillStatus.Filled) {
             this.logger.debug({
               at: "Dataworker#executeSlowRelayLeaves",
@@ -1290,7 +1296,7 @@ export class Dataworker {
         `slowRelayRoot: ${slowRelayTree.getHexRoot()}\n` +
         `Origin chain: ${relayData.originChainId}\n` +
         `Destination chain:${chainId}\n` +
-        `Deposit Id: ${relayData.depositId}\n` +
+        `Deposit Id: ${relayData.depositId.toString()}\n` +
         `amount: ${outputAmount.toString()}`;
 
       if (submitExecution) {
@@ -1324,9 +1330,17 @@ export class Dataworker {
     rootBundleId: number,
     leaf: SlowFillLeaf
   ): { method: string; args: (number | string[] | SlowFillLeaf)[] } {
-    const method = "executeV3SlowRelayLeaf";
+    const method = "executeSlowRelayLeaf";
     const proof = slowRelayTree.getHexProof(leaf);
-    const args = [leaf, rootBundleId, proof];
+    const relayDataWithBytes32Params = convertRelayDataParamsToBytes32(leaf.relayData);
+    const args = [
+      {
+        ...leaf,
+        relayData: relayDataWithBytes32Params,
+      },
+      rootBundleId,
+      proof,
+    ];
 
     return { method, args };
   }
@@ -1779,7 +1793,7 @@ export class Dataworker {
       const currentLiquidReserves = this.clients.hubPoolClient.getLpTokenInfoForL1Token(l1Token)?.liquidReserves;
       updatedLiquidReserves[l1Token] = currentLiquidReserves;
       assert(currentLiquidReserves !== undefined && currentLiquidReserves.gte(0), "Liquid reserves should be >= 0");
-      const tokenSymbol = this.clients.hubPoolClient.getTokenInfo(chainId, l1Token)?.symbol;
+      const tokenSymbol = this.clients.hubPoolClient.getTokenInfoForL1Token(l1Token)?.symbol;
 
       // If netSendAmounts is negative, there is no need to update this exchange rate.
       if (netSendAmounts[idx].lte(0)) {
@@ -1879,7 +1893,7 @@ export class Dataworker {
         return;
       }
 
-      const tokenSymbol = this.clients.hubPoolClient.getTokenInfo(hubPoolChainId, l1Token)?.symbol;
+      const tokenSymbol = this.clients.hubPoolClient.getTokenInfoForL1Token(l1Token)?.symbol;
       if (currHubPoolLiquidReserves.gte(requiredNetSendAmountForL1Token)) {
         this.logger.debug({
           at: "Dataworker#_updateExchangeRatesBeforeExecutingNonHubChainLeaves",
@@ -1951,7 +1965,7 @@ export class Dataworker {
     // multiple transactions for the same token.
     if (submitExecution) {
       for (const l1Token of updatedL1Tokens) {
-        const tokenSymbol = this.clients.hubPoolClient.getTokenInfo(hubPoolChainId, l1Token)?.symbol;
+        const tokenSymbol = this.clients.hubPoolClient.getTokenInfoForL1Token(l1Token)?.symbol;
         this.clients.multiCallerClient.enqueueTransaction({
           contract: this.clients.hubPoolClient.hubPool,
           chainId: hubPoolChainId,
@@ -1977,7 +1991,7 @@ export class Dataworker {
         return;
       }
       seenL1Tokens.add(l1Token);
-      const tokenSymbol = this.clients.hubPoolClient.getTokenInfo(chainId, l1Token)?.symbol;
+      const tokenSymbol = this.clients.hubPoolClient.getTokenInfoForL1Token(l1Token)?.symbol;
 
       // Exit early if we recently synced this token.
       const latestFeesCompoundedTime =
@@ -2118,7 +2132,7 @@ export class Dataworker {
             at: "Dataworke#executeRelayerRefundLeaves",
             message: "Cannot validate bundle with insufficient event data. Set a larger DATAWORKER_FAST_LOOKBACK_COUNT",
             invalidBlockRanges,
-            bundleTxn: matchingRootBundle.transactionHash,
+            bundleTxn: matchingRootBundle.txnRef,
           });
           continue;
         }
@@ -2137,7 +2151,7 @@ export class Dataworker {
             chainId,
             rootBundleRelay,
             mainnetRootBundleBlock: matchingRootBundle.blockNumber,
-            mainnetRootBundleTxn: matchingRootBundle.transactionHash,
+            mainnetRootBundleTxn: matchingRootBundle.txnRef,
             publishedRelayerRefundRoot: rootBundleRelay.relayerRefundRoot,
             constructedRelayerRefundRoot: tree.getHexRoot(),
           });
@@ -2165,6 +2179,14 @@ export class Dataworker {
           rootBundleRelay.rootBundleId
         );
       }
+    }
+  }
+
+  protected getTokenInfo(l2Token: string, chainId: number): string {
+    try {
+      return getTokenInfo(l2Token, chainId).symbol;
+    } catch (e) {
+      return "UNKNOWN";
     }
   }
 
@@ -2202,7 +2224,7 @@ export class Dataworker {
           if (leaf.chainId !== chainId) {
             throw new Error("Leaf chainId does not match input chainId");
           }
-          const l1TokenInfo = this.clients.hubPoolClient.getL1TokenInfoForL2Token(leaf.l2TokenAddress, chainId);
+          const symbol = this.getTokenInfo(leaf.l2TokenAddress, chainId);
           // @dev check if there's been a duplicate leaf execution and if so, then exit early.
           // Since this function is happening near the end of the dataworker run and leaf executions are
           // relatively infrequent, the additional RPC latency and cost is acceptable.
@@ -2214,14 +2236,16 @@ export class Dataworker {
             rootBundleId,
             leaf.leafId
           );
-          const duplicateEvents = await client.spokePool.queryFilter(
-            eventFilter,
-            client.latestBlockSearched - (client.eventSearchConfig.maxBlockLookBack ?? 5_000)
-          );
+          const searchConfig = {
+            maxBlockLookBack: client.eventSearchConfig.maxBlockLookBack,
+            fromBlock: client.latestBlockSearched - client.eventSearchConfig.maxBlockLookBack,
+            toBlock: await client.spokePool.provider.getBlockNumber(),
+          };
+          const duplicateEvents = await sdkUtils.paginatedEventQuery(client.spokePool, eventFilter, searchConfig);
           if (duplicateEvents.length > 0) {
             this.logger.debug({
               at: "Dataworker#executeRelayerRefundLeaves",
-              message: `Relayer Refund Leaf #${leaf.leafId} for ${l1TokenInfo?.symbol} on chain ${leaf.chainId} already executed`,
+              message: `Relayer Refund Leaf #${leaf.leafId} for ${symbol} on chain ${leaf.chainId} already executed`,
               duplicateEvents,
             });
             return undefined;
@@ -2255,7 +2279,7 @@ export class Dataworker {
           if (!success) {
             this.logger.warn({
               at: "Dataworker#_executeRelayerRefundLeaves",
-              message: `Not executing relayer refund leaf on chain ${leaf.chainId} due to lack of spoke or msg.sender funds for token ${l1TokenInfo?.symbol}`,
+              message: `Not executing relayer refund leaf on chain ${leaf.chainId} due to lack of spoke or msg.sender funds for token ${symbol}`,
               root: relayerRefundTree.getHexRoot(),
               bundle: rootBundleId,
               leafId: leaf.leafId,
@@ -2294,11 +2318,11 @@ export class Dataworker {
     ).filter(isDefined);
 
     fundedLeaves.forEach((leaf) => {
-      const l1TokenInfo = this.clients.hubPoolClient.getL1TokenInfoForL2Token(leaf.l2TokenAddress, chainId);
+      const symbol = this.getTokenInfo(leaf.l2TokenAddress, chainId);
 
       const mrkdwn = `rootBundleId: ${rootBundleId}\nrelayerRefundRoot: ${relayerRefundTree.getHexRoot()}\nLeaf: ${
         leaf.leafId
-      }\nchainId: ${chainId}\ntoken: ${l1TokenInfo?.symbol}\namount: ${leaf.amountToReturn.toString()}`;
+      }\nchainId: ${chainId}\ntoken: ${symbol}\namount: ${leaf.amountToReturn.toString()}`;
       if (submitExecution) {
         const valueToPassViaPayable = getMsgValue(leaf);
         this.clients.multiCallerClient.enqueueTransaction({
@@ -2311,7 +2335,7 @@ export class Dataworker {
           mrkdwn,
           // If mainnet, send through Multicall3 so it can be batched with PoolRebalanceLeaf executions, otherwise
           // SpokePool.multicall() is fine.
-          unpermissioned: Number(chainId) === CHAIN_IDs.MAINNET,
+          unpermissioned: Number(chainId) === this.clients.hubPoolClient.chainId,
           // If simulating mainnet execution, can fail as it may require funds to be sent from
           // pool rebalance leaf.
           canFailInSimulation: leaf.chainId === this.clients.hubPoolClient.chainId,

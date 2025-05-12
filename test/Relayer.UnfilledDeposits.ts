@@ -1,14 +1,7 @@
 import * as contracts from "@across-protocol/contracts/dist/test-utils";
 import { ExpandedERC20__factory as ERC20 } from "@across-protocol/contracts";
 import { utils as sdkUtils } from "@across-protocol/sdk";
-import {
-  AcrossApiClient,
-  ConfigStoreClient,
-  HubPoolClient,
-  MultiCallerClient,
-  SpokePoolClient,
-  TokenClient,
-} from "../src/clients";
+import { AcrossApiClient, ConfigStoreClient, HubPoolClient, MultiCallerClient, SpokePoolClient } from "../src/clients";
 import { DepositWithBlock, FillStatus } from "../src/interfaces";
 import {
   CHAIN_ID_TEST_LIST,
@@ -18,7 +11,14 @@ import {
   destinationChainId,
   repaymentChainId,
 } from "./constants";
-import { MockInventoryClient, MockProfitClient, MockConfigStoreClient, MockedMultiCallerClient } from "./mocks";
+import {
+  MockInventoryClient,
+  MockProfitClient,
+  MockConfigStoreClient,
+  MockedMultiCallerClient,
+  SimpleMockHubPoolClient,
+  SimpleMockTokenClient,
+} from "./mocks";
 import {
   BigNumber,
   Contract,
@@ -36,6 +36,7 @@ import {
   lastSpyLogIncludes,
   randomAddress,
   setupTokensForWallet,
+  deployMulticall3,
 } from "./utils";
 
 // Tested
@@ -53,9 +54,10 @@ describe("Relayer: Unfilled Deposits", async function () {
   let spokePoolClient_1: SpokePoolClient, spokePoolClient_2: SpokePoolClient;
   let configStoreClient: MockConfigStoreClient, hubPoolClient: HubPoolClient;
   let spokePoolClients: Record<number, SpokePoolClient>;
-  let multiCallerClient: MultiCallerClient, tryMulticallClient: MultiCallerClient, tokenClient: TokenClient;
+  let multiCallerClient: MultiCallerClient, tryMulticallClient: MultiCallerClient, tokenClient: SimpleMockTokenClient;
   let profitClient: MockProfitClient;
   let spokePool1DeploymentBlock: number, spokePool2DeploymentBlock: number;
+  let inventoryClient: MockInventoryClient;
 
   let relayerInstance: Relayer;
   let unfilledDeposits: RelayerUnfilledDeposit[] = [];
@@ -93,13 +95,20 @@ describe("Relayer: Unfilled Deposits", async function () {
       { l2ChainId: 1, spokePool: spokePool_2 },
     ]));
 
+    for (const deployer of [depositor, relayer]) {
+      await deployMulticall3(deployer);
+    }
+
     ({ configStore } = await deployConfigStore(owner, [l1Token]));
 
     configStoreClient = new MockConfigStoreClient(spyLogger, configStore, undefined, undefined, CHAIN_ID_TEST_LIST);
     await configStoreClient.update();
 
-    hubPoolClient = new HubPoolClient(spyLogger, hubPool, configStoreClient);
+    hubPoolClient = new SimpleMockHubPoolClient(spyLogger, hubPool, configStoreClient);
     await hubPoolClient.update();
+    (hubPoolClient as SimpleMockHubPoolClient).mapTokenInfo(l1Token.address, "L1Token1");
+    (hubPoolClient as SimpleMockHubPoolClient).mapTokenInfo(erc20_1.address, "L1Token1");
+    (hubPoolClient as SimpleMockHubPoolClient).mapTokenInfo(erc20_2.address, "L1Token1");
 
     spokePoolClient_1 = new SpokePoolClient(
       spyLogger,
@@ -120,11 +129,19 @@ describe("Relayer: Unfilled Deposits", async function () {
     spokePoolClients = { [originChainId]: spokePoolClient_1, [destinationChainId]: spokePoolClient_2 };
     multiCallerClient = new MockedMultiCallerClient(spyLogger);
     tryMulticallClient = new MockedMultiCallerClient(spyLogger);
-    tokenClient = new TokenClient(spyLogger, relayer.address, spokePoolClients, hubPoolClient);
+    tokenClient = new SimpleMockTokenClient(spyLogger, relayer.address, spokePoolClients, hubPoolClient);
+    tokenClient.setRemoteTokens([l1Token, erc20_1, erc20_2]);
     profitClient = new MockProfitClient(spyLogger, hubPoolClient, spokePoolClients, []);
     await profitClient.initToken(l1Token);
 
     const chainIds = Object.values(spokePoolClients).map(({ chainId }) => chainId);
+    inventoryClient = new MockInventoryClient(null, null, null, null, null, hubPoolClient);
+    inventoryClient.setTokenMapping({
+      [l1Token.address]: {
+        [originChainId]: erc20_1.address,
+        [destinationChainId]: erc20_2.address,
+      },
+    });
     relayerInstance = new Relayer(
       relayer.address,
       spyLogger,
@@ -135,7 +152,7 @@ describe("Relayer: Unfilled Deposits", async function () {
         profitClient,
         tokenClient,
         multiCallerClient,
-        inventoryClient: new MockInventoryClient(null, null, null, null, null, hubPoolClient),
+        inventoryClient,
         acrossApiClient: new AcrossApiClient(spyLogger, hubPoolClient, chainIds),
         tryMulticallClient,
       },
@@ -258,7 +275,7 @@ describe("Relayer: Unfilled Deposits", async function () {
     // Make an invalid fills by tweaking outputAmount and depositId, respectively.
     const fakeDeposit = { ...deposit, outputAmount: deposit.outputAmount.sub(bnOne) };
     const invalidFill = await fillV3Relay(spokePool_2, fakeDeposit, relayer);
-    const wrongDepositId = { ...deposit, depositId: deposit.depositId + 1 };
+    const wrongDepositId = { ...deposit, depositId: deposit.depositId.add(1) };
     await fillV3Relay(spokePool_2, wrongDepositId, relayer);
 
     // The deposit should show up as unfilled, since the fill was incorrectly applied to the wrong deposit.
@@ -268,9 +285,17 @@ describe("Relayer: Unfilled Deposits", async function () {
       .excludingEvery(["realizedLpFeePct", "quoteBlockNumber", "fromLiteChain", "toLiteChain"])
       .to.deep.equal([
         {
-          deposit,
+          deposit: {
+            ...deposit,
+            depositId: sdkUtils.toBN(deposit.depositId),
+          },
           unfilledAmount: deposit.outputAmount,
-          invalidFills: [invalidFill],
+          invalidFills: [
+            {
+              ...invalidFill,
+              depositId: sdkUtils.toBN(invalidFill.depositId),
+            },
+          ],
           version: configStoreClient.configStoreVersion,
         },
       ]);
@@ -312,17 +337,17 @@ describe("Relayer: Unfilled Deposits", async function () {
         deposit.depositId,
         originChainId,
         updatedOutputAmount,
-        deposit.recipient,
+        sdkUtils.toBytes32(deposit.recipient),
         deposit.message
       );
 
       await spokePool_1
         .connect(depositor)
-        .speedUpV3Deposit(
-          depositor.address,
+        .speedUpDeposit(
+          sdkUtils.toBytes32(depositor.address),
           deposit.depositId,
           updatedOutputAmount,
-          deposit.recipient,
+          sdkUtils.toBytes32(deposit.recipient),
           deposit.message,
           signature
         );
@@ -358,10 +383,6 @@ describe("Relayer: Unfilled Deposits", async function () {
     await updateAllClients();
     unfilledDeposits = _getAllUnfilledDeposits();
     expect(unfilledDeposits.length).to.equal(1);
-    expect(sdkUtils.getRelayDataHash(unfilledDeposits[0].deposit, destinationChainId)).to.equal(
-      sdkUtils.getRelayDataHash(deposit, deposit.destinationChainId)
-    );
-
     await fillV3Relay(spokePool_2, deposit, relayer);
 
     await updateAllClients();
@@ -375,17 +396,17 @@ describe("Relayer: Unfilled Deposits", async function () {
       deposit.depositId,
       originChainId,
       updatedOutputAmount,
-      deposit.recipient,
+      sdkUtils.toBytes32(deposit.recipient),
       deposit.message
     );
 
     await spokePool_1
       .connect(depositor)
-      .speedUpV3Deposit(
-        depositor.address,
+      .speedUpDeposit(
+        sdkUtils.toBytes32(depositor.address),
         deposit.depositId,
         updatedOutputAmount,
-        deposit.recipient,
+        sdkUtils.toBytes32(deposit.recipient),
         deposit.message,
         signature
       );
@@ -512,9 +533,17 @@ describe("Relayer: Unfilled Deposits", async function () {
       .excludingEvery(["realizedLpFeePct", "quoteBlockNumber", "fromLiteChain", "toLiteChain"])
       .to.deep.equal([
         {
-          deposit,
+          deposit: {
+            ...deposit,
+            depositId: sdkUtils.toBN(deposit.depositId),
+          },
           unfilledAmount: deposit.outputAmount,
-          invalidFills: [invalidFill],
+          invalidFills: [
+            {
+              ...invalidFill,
+              depositId: sdkUtils.toBN(invalidFill.depositId),
+            },
+          ],
           version: configStoreClient.configStoreVersion,
         },
       ]);

@@ -3,15 +3,22 @@ import { OnChainMessageStatus } from "@consensys/linea-sdk";
 import { Contract } from "ethers";
 import { groupBy } from "lodash";
 import { HubPoolClient, SpokePoolClient } from "../../../clients";
-import { CHAIN_MAX_BLOCK_LOOKBACK, CONTRACT_ADDRESSES } from "../../../common";
-import { EventSearchConfig, Signer, convertFromWei, winston, CHAIN_IDs, ethers, BigNumber } from "../../../utils";
+import { CONTRACT_ADDRESSES } from "../../../common";
+import {
+  EventSearchConfig,
+  Signer,
+  convertFromWei,
+  winston,
+  CHAIN_IDs,
+  ethers,
+  BigNumber,
+  getTokenInfo,
+} from "../../../utils";
 import { CrossChainMessage, FinalizerPromise } from "../../types";
 import {
   determineMessageType,
   findMessageFromTokenBridge,
-  findMessageFromUsdcBridge,
   findMessageSentEvents,
-  getBlockRangeByHoursOffsets,
   getL1MessageServiceContractFromL1ClaimingService,
   initLineaSdk,
 } from "./common";
@@ -39,9 +46,9 @@ export async function lineaL1ToL2Finalizer(
   logger: winston.Logger,
   signer: Signer,
   hubPoolClient: HubPoolClient,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _spokePoolClient: SpokePoolClient,
-  l1ToL2AddressesToFinalize: string[]
+  l2SpokePoolClient: SpokePoolClient,
+  l1SpokePoolClient: SpokePoolClient,
+  senderAddresses: string[]
 ): Promise<FinalizerPromise> {
   const [l1ChainId] = [hubPoolClient.chainId, hubPoolClient.hubPool.address];
   if (l1ChainId !== CHAIN_IDs.MAINNET) {
@@ -56,38 +63,22 @@ export async function lineaL1ToL2Finalizer(
     CONTRACT_ADDRESSES[l1ChainId].lineaL1TokenBridge.abi,
     hubPoolClient.hubPool.provider
   );
-  const l1UsdcBridge = new Contract(
-    CONTRACT_ADDRESSES[l1ChainId].lineaL1UsdcBridge.address,
-    CONTRACT_ADDRESSES[l1ChainId].lineaL1UsdcBridge.abi,
-    hubPoolClient.hubPool.provider
-  );
-
-  // Optimize block range for querying Linea's MessageSent events on L1.
-  const { fromBlock, toBlock } = await getBlockRangeByHoursOffsets(l1ChainId, 24 * 7, 0);
-  logger.debug({
-    at: "Finalizer#LineaL1ToL2Finalizer",
-    message: "Linea MessageSent event filter",
-    fromBlock,
-    toBlock,
-  });
-
   const searchConfig: EventSearchConfig = {
-    fromBlock,
-    toBlock,
-    maxBlockLookBack: CHAIN_MAX_BLOCK_LOOKBACK[l1ChainId] || 10_000,
+    fromBlock: l1SpokePoolClient.eventSearchConfig.fromBlock,
+    toBlock: l1SpokePoolClient.latestBlockSearched,
+    maxBlockLookBack: l1SpokePoolClient.eventSearchConfig.maxBlockLookBack,
   };
 
-  const [wethAndRelayEvents, tokenBridgeEvents, usdcBridgeEvents] = await Promise.all([
+  const [wethAndRelayEvents, tokenBridgeEvents] = await Promise.all([
     findMessageSentEvents(
       getL1MessageServiceContractFromL1ClaimingService(lineaSdk.getL1ClaimingService(), hubPoolClient.hubPool.provider),
-      l1ToL2AddressesToFinalize,
+      senderAddresses,
       searchConfig
     ),
-    findMessageFromTokenBridge(l1TokenBridge, l1MessageServiceContract, l1ToL2AddressesToFinalize, searchConfig),
-    findMessageFromUsdcBridge(l1UsdcBridge, l1MessageServiceContract, l1ToL2AddressesToFinalize, searchConfig),
+    findMessageFromTokenBridge(l1TokenBridge, l1MessageServiceContract, senderAddresses, searchConfig),
   ]);
 
-  const messageSentEvents = [...wethAndRelayEvents, ...tokenBridgeEvents, ...usdcBridgeEvents];
+  const messageSentEvents = [...wethAndRelayEvents, ...tokenBridgeEvents];
   const enrichedMessageSentEvents = await sdkUtils.mapAsync(messageSentEvents, async (event) => {
     const {
       transactionHash: txHash,
@@ -100,7 +91,7 @@ export async function lineaL1ToL2Finalizer(
     const messageStatus = await getL1ToL2MessageStatusUsingCustomProvider(
       l2MessageServiceContract,
       _messageHash,
-      _spokePoolClient.spokePool.provider
+      l2SpokePoolClient.spokePool.provider
     );
     return {
       messageSender: _from,
@@ -162,7 +153,7 @@ export async function lineaL1ToL2Finalizer(
         miscReason: "lineaClaim:relayMessage",
       };
     } else {
-      const { decimals, symbol: l1TokenSymbol } = hubPoolClient.getTokenInfo(l1ChainId, messageType.l1TokenAddress);
+      const { decimals, symbol: l1TokenSymbol } = getTokenInfo(messageType.l1TokenAddress, l1ChainId);
       const amountFromWei = convertFromWei(messageType.amount.toString(), decimals);
       crossChainCall = {
         originationChainId: l1ChainId,
